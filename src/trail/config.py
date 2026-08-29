@@ -140,9 +140,9 @@ class Settings(BaseSettings):
     checkpointer: Literal["memory", "postgres"] = "memory"
 
     #: Which example agent to mount. Resolved against the registry in
-    #: ``trail.runtime.registry``; the shipped one is ``trail_guide``, which
-    #: answers questions about this repository.
-    agent: str = "trail_guide"
+    #: ``trail.runtime.registry``; the default is ``banking``, the control-plane
+    #: demo. ``trail_guide`` still ships and answers questions about TRAIL.
+    agent: str = "banking"
 
 
 @lru_cache(maxsize=1)

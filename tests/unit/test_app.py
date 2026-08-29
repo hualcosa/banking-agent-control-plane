@@ -121,7 +121,7 @@ def test_starting_a_thread_costs_no_model_call(monkeypatch: pytest.MonkeyPatch) 
     with running_app(monkeypatch, scripted()) as client:
         thread = open_thread(client)
 
-    assert thread["agent"] == "trail_guide"
+    assert thread["agent"] == "banking"
     assert thread["greeting"]
     assert thread["guardrails"] == "both"
     # A real uuid4, not an accidental echo of some fixed string.

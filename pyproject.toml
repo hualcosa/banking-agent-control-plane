@@ -66,7 +66,7 @@ trail = "trail.cli:main"
 # `examples` ships in the image: the demo agent is mounted by name at runtime
 # (TRAIL_AGENT), so it has to be importable from an installed wheel, not just
 # from a source checkout.
-packages = ["src/trail", "examples"]
+packages = ["src/trail", "src/control_plane", "examples"]
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["trail", "examples", "tests"]
+known-first-party = ["trail", "control_plane", "examples", "tests"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests assert on values; a bare comparison in a test is the assertion, and
@@ -154,7 +154,7 @@ asyncio_default_fixture_loop_scope = "function"
 # everywhere, so it is the only one a threshold can be enforced on. The
 # integration tier adds coverage but only where a stack and a real key exist.
 [tool.coverage.run]
-source = ["trail"]
+source = ["trail", "control_plane"]
 
 [tool.coverage.report]
 fail_under = 90

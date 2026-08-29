@@ -36,7 +36,7 @@ x-trail-env: &trail-env
   TRAIL_OTEL_EXPORTER_OTLP_HEADERS: ${TRAIL_OTEL_EXPORTER_OTLP_HEADERS:-Authorization=Basic cGstbGYtdHJhaWwtZGVtbzpzay1sZi10cmFpbC1kZW1v,x-langfuse-ingestion-version=4}
   # The three dials. Defaults are the safe ones: both gates on, and state in
   # memory so a first `make up` needs no schema and loses nothing that matters.
-  TRAIL_AGENT: ${TRAIL_AGENT:-trail_guide}
+  TRAIL_AGENT: ${TRAIL_AGENT:-banking}
   TRAIL_GUARDRAILS: ${TRAIL_GUARDRAILS:-both}
   TRAIL_CHECKPOINTER: ${TRAIL_CHECKPOINTER:-postgres}
   # The one address here that is deliberately NOT a container name. The agent

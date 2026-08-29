@@ -21,6 +21,7 @@ from trail.runtime.agent import AgentSpec
 #: the package rather than the module is what keeps those two in step — an
 #: example cannot be mounted under one name and evaluated under another.
 EXAMPLES: dict[str, str] = {
+    "banking": "examples.banking",
     "trail_guide": "examples.trail_guide",
 }
 

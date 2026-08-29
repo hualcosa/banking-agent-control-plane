@@ -1,0 +1,196 @@
+"""What the model may call. Every tool is a thin call into the control plane.
+
+None of these functions touches the bank. ``propose_pix`` produces a proposal
+and gets back what the control plane needs; ``confirm_pix`` hands over a
+token; the bank is reached only inside ``ControlPlane._execute``, which no
+tool can call. That is the boundary, enforced by import structure rather than
+by prompt.
+
+Results are JSON so the model relays fields rather than paraphrasing them. A
+``status`` the model did not receive is a status it cannot truthfully claim.
+
+Identity is mocked: every session is one customer. The session is real — it is
+the thread — which is what makes a confirmation non-transferable between
+conversations.
+
+# ponytail: one ControlPlane per process, one hard-coded customer. V1 injects
+# the plane per request and reads the customer from the channel's identity.
+"""
+
+from __future__ import annotations
+
+import json
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from langchain.tools import ToolRuntime
+
+from control_plane import (
+    Context,
+    ControlPlane,
+    GetBalance,
+    GetCardTransactions,
+    Outcome,
+    ProposedPix,
+)
+
+PLANE = ControlPlane()
+
+CUSTOMER_ID = "cust_123"
+
+
+def context_for(runtime: ToolRuntime) -> Context:
+    """The session context, from the thread the graph is running in."""
+    thread_id = (
+        (runtime.config or {}).get("configurable", {}).get("thread_id", "no-thread")
+    )
+    return Context(
+        customer_id=CUSTOMER_ID, session_id=str(thread_id), channel="whatsapp"
+    )
+
+
+def _render(outcome: Outcome) -> str:
+    return json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False)
+
+
+def _amount(text: str) -> Decimal | None:
+    """``"300"``, ``"300,50"``, ``"R$ 1.200,00"`` → ``Decimal``; garbage → ``None``."""
+    cleaned = text.replace("R$", "").replace(" ", "")
+    if "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation:
+        return None
+
+
+def get_balance(runtime: ToolRuntime) -> str:
+    """Consulta o saldo da conta corrente do cliente.
+
+    Returns:
+        JSON com ``data.display`` (saldo formatado em reais).
+    """
+    return _render(PLANE.query(context_for(runtime), GetBalance()))
+
+
+def get_card_transactions(runtime: ToolRuntime, days: int = 7) -> str:
+    """Lista as compras do cartão de crédito dos últimos dias.
+
+    Args:
+        days: Quantos dias para trás olhar (1 a 90). Use 2 para "ontem".
+
+    Returns:
+        JSON com ``data.transactions``: data, estabelecimento, valor, categoria.
+    """
+    return _render(PLANE.query(context_for(runtime), GetCardTransactions(days=days)))
+
+
+def propose_pix(runtime: ToolRuntime, recipient: str, amount: str) -> str:
+    """Propõe um PIX. NÃO envia dinheiro: devolve o que falta para enviar.
+
+    Args:
+        recipient: O nome do destinatário como o cliente disse (ex.: "Renata").
+        amount: O valor como o cliente disse (ex.: "300", "1.250,00").
+
+    Returns:
+        JSON com ``status``:
+        - ``REQUIRE_CONFIRMATION``: mostre ``data.recipient`` e ``data.display``
+          ao cliente e peça confirmação explícita. Guarde ``confirmation_id``.
+        - ``REQUIRE_MORE_INFO``: pergunte qual dos ``data.candidates``.
+        - ``REQUIRE_STEP_UP_AUTH``: peça ao cliente para aprovar no aplicativo.
+          Guarde ``intent_id``.
+        - ``DENY``: explique ``message``. Não tente de novo com outro valor.
+    """
+    value = _amount(amount)
+    if value is None:
+        return _render(
+            Outcome(status="REQUIRE_MORE_INFO", message=f"valor inválido: {amount!r}")
+        )
+    try:
+        proposed = ProposedPix(recipient=recipient, amount=value)
+    except ValueError as exc:
+        return _render(
+            Outcome(status="REQUIRE_MORE_INFO", message=str(exc).splitlines()[0])
+        )
+    return _render(
+        PLANE.propose(
+            context_for(runtime), proposed, request_text=f"{recipient} {amount}"
+        )
+    )
+
+
+def confirm_pix(runtime: ToolRuntime, confirmation_id: str) -> str:
+    """Executa o PIX que o cliente acabou de confirmar explicitamente.
+
+    Chame SOMENTE depois de o cliente responder que sim ao valor e destinatário
+    exatos que você apresentou. Idempotente: chamar duas vezes não paga duas.
+
+    Args:
+        confirmation_id: O ``confirmation_id`` devolvido por ``propose_pix``.
+
+    Returns:
+        JSON com ``status``: ``COMPLETED``, ``FAILED``, ``UNKNOWN`` (sem
+        resposta do banco — use ``check_pix``) ou ``DENY``.
+    """
+    return _render(PLANE.confirm(context_for(runtime), confirmation_id))
+
+
+def cancel_pix(runtime: ToolRuntime, confirmation_id: str) -> str:
+    """Cancela um PIX proposto que o cliente decidiu não enviar.
+
+    Args:
+        confirmation_id: O ``confirmation_id`` devolvido por ``propose_pix``.
+    """
+    return _render(PLANE.cancel(context_for(runtime), confirmation_id))
+
+
+def approve_step_up(runtime: ToolRuntime, intent_id: str) -> str:
+    """Registra que o cliente aprovou a ação no aplicativo (simulado na V0).
+
+    Chame SOMENTE depois de o cliente dizer que aprovou no aplicativo. Devolve
+    o próximo passo — normalmente ``REQUIRE_CONFIRMATION`` com um
+    ``confirmation_id`` novo.
+
+    Args:
+        intent_id: O ``intent_id`` devolvido por ``propose_pix``.
+    """
+    # ponytail: the LLM relays the approval. In V1 this is a webhook from the
+    # mobile app and disappears from the tool list entirely.
+    return _render(PLANE.step_up(context_for(runtime), intent_id))
+
+
+def check_pix(runtime: ToolRuntime, intent_id: str) -> str:
+    """Consulta o estado de um PIX; se estava ``UNKNOWN``, reconcilia com o banco.
+
+    Args:
+        intent_id: O ``intent_id`` do PIX.
+    """
+    return _render(PLANE.reconcile(context_for(runtime), intent_id))
+
+
+def explain_action(intent_id: str) -> str:
+    """A trilha de auditoria de uma ação: cada evento registrado, em ordem.
+
+    Args:
+        intent_id: O ``intent_id`` de um PIX ou o id de uma consulta.
+    """
+    events: list[dict[str, Any]] = [
+        e.model_dump(mode="json") for e in PLANE.explain(intent_id)
+    ]
+    if not events:
+        return json.dumps(
+            {"intent_id": intent_id, "events": [], "message": "nenhum registro"}
+        )
+    return json.dumps({"intent_id": intent_id, "events": events}, ensure_ascii=False)
+
+
+TOOLS = [
+    get_balance,
+    get_card_transactions,
+    propose_pix,
+    confirm_pix,
+    cancel_pix,
+    approve_step_up,
+    check_pix,
+    explain_action,
+]

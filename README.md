@@ -1,48 +1,140 @@
-# TRAIL
+# Banking Agent Control Plane
 
-**Traced Runtime for Agents, Instrumented Locally.**
+**A trusted boundary between a probabilistic agent and deterministic banking systems.**
 
-A local, full-stack scaffold for building agentic systems whose behaviour can be **observed,
-reproduced and argued with**. Every turn exposes the pipeline that produced it. Every model call
-emits a trace. Every trace carries tokens, latency and cost. The golden-set harness measures the
-same HTTP interface that people actually use.
+The LLM understands what the customer wants and proposes an action. It never moves money. Every
+sensitive operation crosses a deterministic control plane — typed action, entity resolution,
+preconditions, risk, policy, explicit confirmation, a state machine, an idempotent execution
+gateway, and an append-only ledger that can explain, after the fact, why the action happened.
 
-![TRAIL architecture: browser and CLI clients connect to the agent runtime, PostgreSQL, an LLM provider and a self-hosted Langfuse observability stack](docs/assets/trail-architecture.png)
+```
+WhatsApp / voice / web            ← channels are adapters; text first
+        ↓
+   Agent runtime (LLM + tools)    ← understands, clarifies, PROPOSES
+        ↓  typed ProposedPix
+   Control plane                  ← resolves, validates, scores, decides, confirms, executes, audits
+        ↓  CreatePix + idempotency key
+   Bank adapter (mocked in V0)
+```
 
 <p align="center">
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-7c3aed?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-runtime-0e7490?style=flat-square&logo=fastapi&logoColor=white">
-  <img alt="Docker Compose" src="https://img.shields.io/badge/Docker-Compose-7c3aed?style=flat-square&logo=docker&logoColor=white">
-  <img alt="253 unit tests" src="https://img.shields.io/badge/unit_tests-253_passing-0e7490?style=flat-square">
+  <img alt="293 unit tests" src="https://img.shields.io/badge/unit_tests-293_passing-0e7490?style=flat-square">
   <img alt="97% coverage" src="https://img.shields.io/badge/coverage-97%25-7c3aed?style=flat-square">
 </p>
 
-> **The thing you measure is the thing you shipped.**
+> **The agent may propose actions. The control plane authorizes and executes them.**
 
-TRAIL is not an agent framework. Bring LangGraph, an SDK or a `while` loop; TRAIL does not own your
-prompt, graph or model calls. It owns the part every serious agent needs by week three: the runtime
-spine around the agent — HTTP and SSE, guardrails, persistence, telemetry, cost accounting and
-evaluation.
+This repository is V0: one customer, one account, three capabilities (`get_balance`,
+`get_card_transactions`, `create_pix`), a mocked bank, in-process state. The *shape* is the
+enterprise one — every boundary that a real deployment needs already exists as a module with a
+narrow interface — and the implementation behind each boundary is the smallest thing that works.
 
-**Start here:** [Quickstart](#3-quickstart) · [Architecture](#4-architecture) ·
-[The extension seam](#5-what-is-yours-and-what-is-trails) · [Example agent](#7-the-example-agent) ·
-[Repository map](#10-repository-layout)
-
-The name is literal. TRAIL is the scaffold behind [**The Audit Trail**](https://github.com/hualcosa)
-— a series on AI platform architecture and observability in regulated industries, banking, financial
-services and insurance first. Every entry in the series ships a working demo, and every demo is an
-instance of this repository.
+It is built on [TRAIL](#trail--the-runtime-underneath), the traced agent runtime it was forked
+from: guardrails, SSE pipeline rail, OTel → Langfuse, Postgres threads and the golden-set harness
+come from there and are described in the second half of this file.
 
 ---
 
-> ## Status
->
-> Everything this README describes runs today: `make test` passes 253 unit tests offline at 97%
-> coverage, `make up` starts the stack, `make chat` and the browser drive the same runtime, and
-> `make eval` grades a twelve-case golden set against pre-registered thresholds. The one thing
-> described here that is not built is the cloud deployment (§9), and it says so where it appears.
->
-> When this file and the code disagree, that is a bug in this file.
+## The control plane
+
+Everything lives in `src/control_plane/`, five modules, no framework:
+
+| Module | Owns | The one thing to read |
+|---|---|---|
+| `actions.py` | Typed actions, `Context`, capability registry | `ProposedPix` (what the agent may say) vs `CreatePix` (canonical; only the plane builds it) |
+| `policy.py` | Mocked risk signals; ordered policy rules | `evaluate()` — first rule that applies decides; every verdict names its rule |
+| `state.py` | `Intent`, the state machine, the ledger | `TRANSITIONS` — a hop not in the table raises and is recorded |
+| `bank.py` | The mock bank | `create_pix(idempotency_key=…)` — same key twice, one payment |
+| `plane.py` | `propose` · `step_up` · `confirm` · `cancel` · `reconcile` · `explain` | `_execute()` — the only place the bank is asked to move money |
+
+### The write path
+
+```
+"manda 300 pra Renata"
+   ↓ agent → propose_pix(recipient="Renata", amount="300")
+   ↓ plane:  resolve contact (exactly one, or REQUIRE_MORE_INFO)
+             build CreatePix · check preconditions (funds, account)
+             risk → policy → REQUIRE_CONFIRMATION + confirmation_id     state: AWAITING_CONFIRMATION
+"Você vai enviar R$ 300,00 para Renata Silva. Confirma?"
+"sim"
+   ↓ agent → confirm_pix(confirmation_id)
+   ↓ plane:  same customer AND same session? → AUTHORIZED → SUBMITTED
+             bank.create_pix(idempotency_key=intent.id) → COMPLETED
+"Feito. R$ 300,00 enviados para Renata Silva."
+```
+
+The states, all of them: `CREATED → VALIDATED → [AWAITING_STEP_UP →] AWAITING_CONFIRMATION →
+AUTHORIZED → SUBMITTED → COMPLETED`, with `FAILED`, `CANCELLED`, `REVERSED`, `PENDING` and
+`UNKNOWN` off the side. `UNKNOWN` is what a timeout after `SUBMITTED` produces, and it is resolved
+by `reconcile` (ask the bank what it did) — never by paying again.
+
+### The policy, in one table
+
+| Condition | Verdict | Rule |
+|---|---|---|
+| amount > R$ 5.000 | `DENY` | `pix_hard_limit` |
+| amount > R$ 1.000, or risk `high`, and session assurance < `strong` | `REQUIRE_STEP_UP_AUTH` | `pix_step_up` |
+| capability requires confirmation (every PIX) | `REQUIRE_CONFIRMATION` | `capability_requires_confirmation` |
+
+Risk is mocked as three signals — `new_recipient`, `unusual_amount` (> R$ 500), `untrusted_device`
+— with fixed weights. The numbers are in `policy.py`, not in the prompt, and changing one is a code
+review rather than a prompt edit.
+
+### What the tests prove (`tests/unit/test_control_plane.py`, `test_banking_agent.py`)
+
+* Proposing moves nothing. Confirming moves money exactly once — a model that calls `confirm_pix`
+  twice in one turn produces one payment.
+* A `confirmation_id` is honoured only from the customer **and** the thread that created it. A
+  made-up one, or one from another conversation, is `DENY` with nothing moved.
+* A timeout leaves `UNKNOWN`, a second confirm still pays nothing, `reconcile` finds the receipt.
+* Two contacts named Ana come back as a question. A PIX over the limit is refused by rule name.
+* `explain(intent_id)` returns the persisted chain: request → interpreted → resolution →
+  canonical_action → risk → policy → confirmation → authorization → execution_request →
+  backend_response.
+
+### Demo tripwires
+
+Deliberate, so the interesting paths are reachable from a chat:
+
+* **Ana** matches two contacts → `REQUIRE_MORE_INFO`.
+* **João** has never been paid; > R$ 500 to him is `high` risk → step-up below the amount threshold.
+* An amount whose cents are **.13** (e.g. `300,13`) is paid *and then* times out → `UNKNOWN`;
+  ask the assistant to check and it reconciles.
+* The card has an **iFood R$ 129,00** charge dated yesterday.
+
+### The agent (`examples/banking/`)
+
+Eight tools, each a thin call into the plane; none can reach the bank. `approve_step_up` is the one
+that would not exist in V1 — it stands in for the mobile app's out-of-band approval, and says so.
+The system prompt is short because the rules that matter are not in it: it makes the model a
+faithful relay of the `status` it received, and forbids claiming a payment without a `COMPLETED`.
+
+`make chat` talks to it. `make eval` runs `examples/banking/golden.py` — ten cases, thresholds
+pre-registered, two of them zero-tolerance policy (a claimed payment that did not happen; a blocked
+benign question).
+
+### What V0 leaves out, on purpose
+
+Identity (one hard-coded customer), a risk engine, real step-up, Open Finance, a real PIX rail,
+voice, a persistent store for intents and ledger, reconciliation infrastructure. Each is a
+`# ponytail:` comment naming the ceiling and the upgrade path; `grep -rn "ponytail:" src` lists them.
+
+---
+
+# TRAIL — the runtime underneath
+
+Everything below this line describes the scaffold this repository was forked from. It is unchanged
+except that the default mounted agent is now `banking` (`TRAIL_AGENT=trail_guide` brings the
+original back).
+
+**Traced Runtime for Agents, Instrumented Locally.** A local, full-stack scaffold for building
+agentic systems whose behaviour can be **observed, reproduced and argued with**. Every turn exposes
+the pipeline that produced it. Every model call emits a trace. Every trace carries tokens, latency
+and cost. The golden-set harness measures the same HTTP interface that people actually use.
+
+![TRAIL architecture: browser and CLI clients connect to the agent runtime, PostgreSQL, an LLM provider and a self-hosted Langfuse observability stack](docs/assets/trail-architecture.png)
 
 ---
 
@@ -116,7 +208,7 @@ are no tokens to stream anyway, and the pipeline is the only honest thing to sho
 ## 3. Quickstart
 
 ```bash
-git clone https://github.com/hualcosa/TRAIL && cd TRAIL
+git clone https://github.com/hualcosa/banking-agent-control-plane && cd banking-agent-control-plane
 cp .env.example .env          # set TRAIL_LLM_API_KEY
 make test                     # the unit suite with coverage (fails under 90%), offline, no credentials needed
 make up                       # the stack
@@ -361,6 +453,13 @@ Makefile                      The control surface: up · down · chat · eval ·
 .env.example                  Every variable, with its default and the reason for it
 db/schema.sql                 Two tables, and §4 says why only two
 
+src/control_plane/            The boundary. No framework, no bank SDK — see "The control plane" above
+  actions.py                  Context, ProposedPix → CreatePix, the capability registry
+  policy.py                   Mocked risk signals and the ordered rule set
+  state.py                    Intent, TRANSITIONS, IllegalTransition, the append-only Ledger
+  bank.py                     MockBank: idempotent create_pix, the .13 timeout, the reconciliation lookup
+  plane.py                    ControlPlane: propose · step_up · confirm · cancel · reconcile · explain
+
 src/trail/
   config.py                   pydantic-settings, TRAIL_ prefix — and the dials
   costs.py                    Per-model rates; an unpriced model costs None, never zero
@@ -385,6 +484,10 @@ src/trail/
     store.py                  eval_runs · eval_findings, and the baseline lookup
     report.py                 The terminal scorecard: violations first, then numbers
 
+examples/banking/             The default agent. Eight tools, each a call into the control plane
+  agent.py                    The AgentSpec: a relay prompt, the tools, injection + secret-leak gates
+  tools.py                    propose_pix · confirm_pix · … — JSON in, JSON out, no bank access
+  golden.py                   Ten cases, two zero-tolerance
 examples/trail_guide/         The agent that explains TRAIL. Two tools, three checks
   agent.py                    The AgentSpec: prompt, tools, GuardSpec
   tools.py                    search_docs · stack_status, both offline
