@@ -36,7 +36,7 @@ Dois achados da exploração mudaram o desenho original:
 
 **Reuso do TRAIL** (não construir):
 - Schema: `db/schema.sql` (SQL puro, idempotente, aplicado por initdb + `evals/store.py:65 ensure_schema`). `intents`/`ledger_events` entram aí. **Armadilha:** initdb só roda em volume vazio — o control plane precisa aplicar o schema no startup como `store.py` já faz, senão "relation does not exist" em volume dev existente.
-- Provider: `runtime/agent.py:85` hardcoded `openai:` → virar setting + `langchain-aws` (~15 linhas). O risco não é o código: é a fila de aprovação de acesso a modelos Bedrock em sa-east-1 → **pedir acesso no dia 1**.
+- Provider: `runtime/agent.py:85` hardcoded `openai:` → virar setting + `langchain-aws` (~15 linhas). Acesso a modelo não é mais gate (a página Model Access foi aposentada em 2025-09-29; modelos serverless habilitam sozinhos na 1ª invocação). O que resta verificar é o **catálogo** de sa-east-1: `aws bedrock list-inference-profiles --region sa-east-1` no dia 1 responde se tool-calling existe nativo ou só via perfil cross-region — dado do ADR de residência.
 - Identidade: seam único em `turns.py:98` (`configurable`); zero auth em `app.py`.
 - Evals: checks só no último turno (`runner.py:189-191`); extensão `turn_checks` ≈ 8 linhas. `Observation` não vê estado do plane → matriz vive em pytest.
 - Coverage: `fail_under=90` sobre `trail`+`control_plane` no tier unit. `PgStore` (SQL só roda em integração) DERRUBA o gate → módulo próprio `control_plane/pgstore.py` + `omit` no coverage **no mesmo commit**.
@@ -104,7 +104,7 @@ T6b Store+MemoryStore → T6c PgStore → T7 sweep → T8 TTL/digest → T13 mat
 
 ## Sessões (cada uma fecha num gate)
 
-**Dia 1, antes de tudo (humano, 15 min):** pedir acesso a modelos Bedrock em sa-east-1 (fila anda enquanto você trabalha); criar conta Langfuse Cloud; rodar `make up && make eval && make eval` pra confirmar a race com os próprios olhos.
+**Dia 1, antes de tudo (5 min):** mapear o catálogo de sa-east-1 (`aws bedrock list-foundation-models --region sa-east-1` + `list-inference-profiles`) — quais modelos com tool-calling existem nativos vs só via perfil cross-region (dado do ADR de residência; não há mais aprovação de acesso a modelo, a página Model Access foi aposentada em 2025-09-29); rodar `make up && make eval && make eval` pra confirmar a race com os próprios olhos.
 
 **S1 — "onde o V0 errou"** · você: T3+T4 + medir p95/custo (1 `make eval`, `concurrency=1`) + correções no ROADMAP.md · subagentes em paralelo: T1, T2, T5, T11, T18, T17-esqueleto · merge: CI primeiro, depois o seu, depois o resto · **Gate: `make lint && make test` ≥90%; nenhuma tool aprova/executa nada.** → material do post 1 completo.
 
