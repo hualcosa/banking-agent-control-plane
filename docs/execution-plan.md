@@ -12,9 +12,13 @@ Dois achados da exploração mudaram o desenho original:
 
 | Decisão | Escolha |
 |---|---|
-| Compute AWS (marco 4) | **ECS Fargate + ALB** (SSE funciona, pool quente, RDS na VPC) |
-| Observabilidade deployada | **Langfuse Cloud** agora (2 env vars, zero código). ADR de observabilidade no marco 6 com 3 candidatos: Langfuse Cloud · LangSmith (OTLP + ~30 linhas de aliases `gen_ai.*` em `telemetry.py`) · AgentCore Observability (ADOT SDK + SigV4, ~1-2 dias, GA em sa-east-1 desde mai/2026). Nunca usar o tracing "nativo" do LangSmith — ignora os spans custom do TRAIL |
-| Identidade (marco 2) | **Header assinado com HMAC** + mapa estático de clientes; seam idêntico a JWT depois |
+| Compute AWS (marco 4) | **AgentCore Runtime** (revisado 2026-09-01 — a audiência é o nicho enterprise-AI da AWS). MicroVM por sessão, `network_mode: VPC` → RDS Postgres (documentado, GA). Contrato: `POST /invocations` + `GET /ping` na 8080, **linux/arm64**, SSE preservado (chunk 10MB, stream até 60min). FastAPI é caminho de primeira classe: o app ganha `/invocations` embrulhando `run_turn` e mantém `/threads` pro compose local — thread_id vai no payload, session id no header (≥33 chars; UUID de 36 passa) |
+| IaC | **CDK TypeScript**, copiando (sem forkar) do template `awslabs/fullstack-solution-template-for-agentcore` (Apache-2.0): `backend-construct.ts` (L2 `agentcore.Runtime` + Identity + custom resources), `cognito-construct.ts`, `frontend/src/lib/agentcore-client/` (client SSE com parser LangGraph pronto), `patterns/utils/auth.py`. VPC é nossa: 2+ subnets privadas em `sae1-az1..3`, NAT, endpoints ecr.dkr/ecr.api/logs + S3 gateway |
+| Observabilidade deployada | **AgentCore Observability** (ADOT SDK, `opentelemetry-instrument` no CMD — como o Dockerfile do template; Transaction Search ligado, que Evaluations exige de todo jeito). Langfuse continua no compose local. ADR do marco 6 mantém os 3 candidatos com números: AgentCore · Langfuse Cloud (2 env vars) · LangSmith (OTLP + ~30 linhas de aliases). Risco conhecido: TracerProvider próprio do TRAIL (`telemetry.py:271`) × auto-instrumentação ADOT — orçar uma tarde |
+| Identidade (marco 2 → 4) | Marco 2: **header assinado com HMAC** + mapa estático (local, offline, testável). Marco 4: **Cognito JWT** no `customJWTAuthorizer` do Runtime (com `customClaims` pro `customer_id`), header `Authorization` no `requestHeaderAllowlist`, decode em processo sem verificar assinatura (o Runtime já validou — padrão do template). O seam é o mesmo (`configurable` em `turns.py:98`); só troca o resolvedor |
+| AgentCore Policy | **Não substitui o control plane — e isso é a tese confirmada.** Cedar sobre tools do Gateway, só allow/deny + `suppressOutput`: sem `REQUIRE_CONFIRMATION`, sem idempotência, sem máquina de estados durável, sem ledger; temporal é por sessão com id do caller (nova sessão zera contadores — a própria AWS flagra). Cobre ~1 das 5 camadas. Vira o ADR/benchmark âncora do marco 6: CREATE_PIX espelhado atrás de Gateway+Cedar em `LOG_ONLY` vs o plane — cobertura das invariantes + latência ($0.000025/req) |
+| AgentCore Evaluations | Candidato pro marco 6 (não substitui a matriz, que é pytest abaixo do agente): lê traces OTel do LangGraph de qualquer runtime, GA em sa-east-1. ADR: TRAIL evals vs Evaluations |
+| Memory / Gateway | **Não usar** (checkpointer LangGraph no Postgres já é dono do estado; Gateway só entra pro experimento de Policy no marco 6) |
 | Step-up out-of-band | **CLI `trail step-up <intent_id>`** — processo separado → Postgres compartilhado (mesma estrutura de um callback de app). Rota HTTP só se a demo precisar |
 | Outbox | Tabela `ledger_events` com o `execution_request` commitado **em transação própria antes** da chamada ao banco; sem worker de relay — a "entrega" é o sweep de restart + `trail reconcile` (dizer isso no post 2) |
 | Ownership do step-up | Step-up amarra a `customer_id` + `intent_id` (cross-channel por natureza); `confirm` continua amarrado à sessão. Vira ADR — e pré-paga a confirmação cross-channel do marco 5 |
@@ -67,7 +71,9 @@ Dois achados da exploração mudaram o desenho original:
 | T14 | Renderer + `make matrix` | T13 | S | `Makefile` | tabela impressa, exit≠0 em célula vermelha |
 | T15 | Golden set adversarial (+5 casos) | T11,T4,T9 | M | `golden.py` | ambíguo, correção, injeção, ação não suportada, saída malformada |
 | T16 | Matar a race do eval (banco por customer / plane por thread) | T9 | S | `bank.py` ou `tools.py` | 3 `make eval` seguidos, mesmo resultado |
-| T17 | IaC: VPC, RDS, ECR, secrets, ECS Fargate + ALB (só 4 serviços — Langfuse Cloud deleta os outros 6) | — | L | `infra/` novo | `terraform plan` limpo |
+| T17 | IaC (CDK TS): VPC (subnets privadas em sae1-az1..3, NAT, endpoints), RDS, ECR, Cognito, AgentCore Runtime (VPC mode + JWT authorizer + header allowlist) — copiando constructs do template FAST | — | L | `infra-cdk/` novo | `cdk synth` limpo |
+| T17b | Contrato do Runtime: `/invocations` (embrulha `run_turn`, SSE) + `/ping` no app; build arm64; `opentelemetry-instrument` no CMD | — | M | `app.py`, `Dockerfile` | container local responde ao contrato via curl |
+| T17c | UI deployada fala com o Runtime: adotar `agentcore-client` (parser LangGraph pronto) + login Cognito | T17 | M | `ui/` | chat streaming em prod via JWT |
 | T18 | Provider seam `TRAIL_LLM_PROVIDER` + `langchain-aws` | — | S | `agent.py:85`, `config.py` | `bedrock_converse:` monta sem rede |
 | T19 | Runbook + `trail intents`/`trail reconcile` | T6c | M | `cli.py`, `docs/runbook.md` | humano resolve `UNKNOWN` só com o doc |
 | T20 | ADR residência sa-east-1 | T18 | S | `docs/adr/` | cita latência medida |
@@ -87,7 +93,7 @@ Dois achados da exploração mudaram o desenho original:
 T6b Store+MemoryStore → T6c PgStore → T7 sweep → T8 TTL/digest → T13 matriz → T14 make matrix
                           ↘ T12 crash seam roda em paralelo com T6c
 ```
-~5 sessões até a matriz; ~8–9 até o fim. Tudo de marcos 1, 4 (CI/IaC/provider) e o loop de benchmark ficam FORA do caminho.
+~5 sessões até a matriz; ~9–10 até o fim (o contrato AgentCore + CDK adicionam ~1 sessão ao marco 4). Tudo de marcos 1, 4 (CI/IaC/provider/T17b) e o loop de benchmark ficam FORA do caminho.
 
 ## Cadeias seriais (mesmos arquivos — nunca 2 subagentes ao mesmo tempo)
 
@@ -110,11 +116,13 @@ T6b Store+MemoryStore → T6c PgStore → T7 sweep → T8 TTL/digest → T13 mat
 
 **S5 — a matriz** · você: T13+T14+T16, T10 · subagentes: T20, T17-final · **Gate: `make matrix` verde, N≥100, <60s.** → post 3 (espinha dorsal, meio do projeto).
 
-**S6 — produção** · T21 · **Gate: `UNKNOWN` real resolvido em prod só com o runbook.** → post 4.
+**S6 — contrato + IaC** · você: T17b (contrato `/invocations`+`/ping`, arm64) · subagentes: T17 (CDK), T17c (UI/agentcore-client) · **Gate: container local responde ao contrato do Runtime; `cdk synth` limpo.**
 
-**S7 — voz** · T22–T25 · **Gate: o número do `git diff --stat`.** → post 5.
+**S7 — produção** · T21 (deploy AgentCore Runtime + RDS via VPC mode) · **Gate: `UNKNOWN` real resolvido em prod só com o runbook.** → post 4.
 
-**S8 — benchmarks + final** · T26–T29 · **Gate: script que falha se algum ADR não aponta pra um número.** → post 6.
+**S8 — voz** · T22–T25 · **Gate: o número do `git diff --stat`.** → post 5.
+
+**S9 — benchmarks + final** · T26–T29 + experimento Policy em shadow (`LOG_ONLY`) · **Gate: script que falha se algum ADR não aponta pra um número.** → post 6 (a série pode virar 8 posts se o shadow de Policy render achado próprio).
 
 ## Armadilhas conhecidas (não redescobrir)
 
@@ -124,6 +132,9 @@ T6b Store+MemoryStore → T6c PgStore → T7 sweep → T8 TTL/digest → T13 mat
 4. Adicionar casos ao golden set muda `golden_set_version` e invalida baselines → congelar `golden.py` ANTES de rodar o benchmark T26.
 5. Step-up out-of-band com `_same_principal` atual rejeita 100% dos callbacks (exige session igual) → afrouxar para customer+intent É a tarefa, não um bug do caminho.
 6. Diff da voz ~0 sem STT real é infalsificável → 1 chamada STT real no T25, e dizer no post que WER de campo é o benchmark T27, não a simulação.
+7. **Residência (CRIS global):** Policy e Evaluations a partir de sa-east-1 usam inferência cross-region GLOBAL — payload pode ser processado fora do Brasil, e CloudWatch não diz onde. Vai pro ADR de residência (T20) como achado, não como surpresa.
+8. **VPC mode do Runtime:** subnet pública NÃO dá internet (NAT obrigatório pra alcançar Bedrock); sem o S3 gateway endpoint o re-pull da imagem passa pelo NAT e custa; bug aberto no template (#49): stream fica pendurado em VPC mode durante o save de Memory — não usamos Memory, mas testar o streaming em VPC antes de gravar demo.
+9. **Sessões do Runtime:** 2 chamadas concorrentes no MESMO session id → HTTP 409 (serializar por thread); sessão é efêmera (idle 15min / máx 8h) — irrelevante pra nós porque o estado vive no Postgres, mas o eval runner precisa de session ids distintos por caso (já tem: um thread por caso).
 
 ## Verificação end-to-end do plano inteiro
 

@@ -131,12 +131,20 @@ menos de um minuto. O comportamento do agente com LLM roda em `make eval`
 **Pergunta:** alguém consegue rodar isso às 3 da manhã?
 
 **O que fazer:**
-- Deploy real: compute, rede, IAM por serviço, secrets, Postgres gerenciado.
+- Deploy real na stack enterprise-AI da AWS (revisado 2026-09-01 — é o nicho da
+  audiência): **AgentCore Runtime** (microVM, VPC mode → RDS Postgres),
+  **AgentCore Identity** (Cognito JWT no authorizer, claims → `Context`),
+  **AgentCore Observability** (ADOT → CloudWatch), IaC em CDK copiando
+  constructs do template `awslabs/fullstack-solution-template-for-agentcore`.
+  O app ganha o contrato do Runtime (`/invocations` + `/ping`, arm64) e mantém
+  as rotas locais pro compose.
 - Runbook: o que um humano faz com um intent em `UNKNOWN`. Caminho de
   reconciliação manual.
 - ADR de residência de dados: Bedrock em `sa-east-1` tem poucos modelos. Se o
   PII tem que ficar no Brasil, a escolha entre modelo limitado, inferência
   cross-region ou provedor externo acontece **aqui**, não no marco 6.
+  Achado da pesquisa: AgentCore Policy/Evaluations em sa-east-1 usam inferência
+  cross-region **global** — o payload pode sair do Brasil. Entra no ADR.
 - Acesso a modelo fica atrás da interface de provider do TRAIL. AWS-first é
   para infra; modelo é agnóstico desde o dia um.
 
@@ -183,6 +191,7 @@ e o diff no control plane está medido.
 | Modelo para extrair a ação tipada | acurácia no golden set × p95 × custo |
 | STT para pt-BR (valores e nomes) | taxa de erro em valores e nomes de contato |
 | Bedrock vs API externa de modelo | latência, custo, residência |
+| Control plane próprio vs AgentCore Policy | CREATE_PIX espelhado atrás de Gateway + Cedar em `LOG_ONLY`: cobertura das 5 invariantes, latência de autorização |
 
 **Entrega final:** "A arquitetura que eu colocaria em produção — e por quê".
 Diagrama final, metas de SLO, domínios de falha, fronteiras de confiança,
