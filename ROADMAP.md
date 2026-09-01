@@ -60,7 +60,8 @@ palavra. Sem meta de latência, o marco 4 não sabe que infra escolher.
   replay de confirmação entre sessões, sequestro de sessão, provedor de modelo
   comprometido, resposta maliciosa da API do banco.
 - Ligar cada adversário a pelo menos uma invariante.
-- Definir metas: p95 de latência por turno, custo por conversa, disponibilidade.
+- Definir metas: p95 de latência por turno, custo por conversa, disponibilidade —
+  e um teto de gasto mensal na AWS (USD). Estourar o teto exige um ADR.
 - Escrever a lista de "não vamos fazer" (acima) no README.
 
 **Terminou quando:** existe `docs/threat-model.md` com tabela adversário → invariante → teste que vai provar.
@@ -76,12 +77,24 @@ repassa a aprovação de step-up. Isso quebra "o LLM nunca encosta no dinheiro".
 O primeiro relatório do projeto é sobre isso: onde o V0 errou, a correção e o
 teste que teria pegado.
 
-**O que fazer:**
-- Trocar dicts por Postgres (`state.py:20`, `plane.py:20`) com outbox transacional.
+**O que fazer** (a ordem interna importa: Postgres → identidade → step-up → regras BACEN —
+o step-up out-of-band só funciona com storage compartilhado):
+- Trocar dicts por Postgres (`state.py:20`, `plane.py:20`); o `execution_request`
+  é commitado em transação própria ANTES da chamada ao banco.
 - Identidade vem do canal, não do agente (`tools.py:16`).
-- Step-up vira webhook; apagar a tool `approve_step_up` (`tools.py:157`).
+- Step-up vira canal out-of-band: `trail step-up <intent_id>` no CLI (processo
+  separado → Postgres compartilhado, a mesma estrutura de um callback de app);
+  apagar a tool `approve_step_up` (`tools.py:157`). O step-up passa a se amarrar
+  a `customer_id` + `intent_id` (cross-channel por natureza); `confirm` continua
+  amarrado à sessão — isso vira ADR e pré-paga o marco 5.
+- TTL de confirmação e digest da ação amarrado à confirmação — sem esses campos,
+  duas células da matriz do marco 3 ("confirmação velha", "ação mutada") são
+  inexpressáveis.
+- Sweep de restart: intent preso em `SUBMITTED` vira `UNKNOWN` na subida do
+  processo (a aresta já existe em `state.py:66`; `reconcile` faz o resto).
 - Duas regras reais do BACEN na política (`policy.py:61`): limite noturno 20h–06h
-  e limite por transação. ~30 linhas, e a política deixa de ser ilustrativa.
+  e limite por transação, com relógio injetado. ~30 linhas, e a política deixa
+  de ser ilustrativa.
 
 **Terminou quando:** o agente não tem mais nenhuma tool capaz de aprovar nada,
 e o control plane sobrevive a reiniciar o processo no meio de um PIX.
@@ -106,8 +119,10 @@ nada. Precisa do Postgres primeiro.
 - O harness de evals do TRAIL só checa o último turno (`src/trail/evals/cases.py:164`).
   Cenários multi-turno vão pro teste de control plane, não pro harness.
 
-**Terminou quando:** `make eval` imprime a matriz e todas as células de
-invariante estão verdes com N ≥ 100 execuções.
+**Terminou quando:** `make matrix` (pytest direto sobre o control plane, sem LLM)
+imprime a matriz e todas as células de invariante estão verdes com N ≥ 100 em
+menos de um minuto. O comportamento do agente com LLM roda em `make eval`
+(N ≈ 20) e é reportado como tabela separada — nunca rotulado "invariante".
 
 ---
 
@@ -147,7 +162,10 @@ o que a voz revelou que faltava.
 **O que fazer:**
 - Um adaptador de voz (um provedor só, sem pipeline realtime próprio).
 - Confiança do STT vira sinal de risco ("trezentos" vs "treze", "Renata" vs "Renato").
-- Confirmação cross-channel: pedido por voz, confirmação por texto.
+- Confirmação cross-channel: pedido por voz, confirmação por texto. A mudança
+  de ownership que permite isso (step-up amarrado a customer + intent) é
+  trabalho do marco 2 — atribuir lá, senão o diff da voz mede trabalho que
+  não é da voz.
 
 **Terminou quando:** um PIX por voz passa pelo mesmo `propose → confirm → execute`
 e o diff no control plane está medido.
