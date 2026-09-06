@@ -17,7 +17,7 @@ the other, or both.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -157,21 +157,43 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class Case:
-    """One scripted conversation, and what must be true at the end of it.
+    """One scripted conversation, and what must be true along and at the end of it.
 
     ``turns`` is a list because context matters — the second question is often
-    only interesting after the first. The checks run against the **last** turn.
-    # ponytail: last-turn-only assertions. A case needing a mid-conversation
-    # assertion should be split into two cases; add per-turn checks when a real
-    # one cannot be.
+    only interesting after the first. ``checks`` run against the **last** turn,
+    which is the common case: earlier turns exist to build the context the final
+    question is asked in.
+
+    ``turn_checks`` is the escape hatch for the conversations where that is not
+    true. A two-turn case that must not claim a transfer was sent *before* the
+    confirmation is a real assertion about turn 0, and splitting it into two
+    cases loses the only thing that made it interesting — that the same thread
+    kept its head between the two questions. Keyed by turn index so the check
+    sits next to the number of the turn it judges, and so a case can assert on
+    several turns without the reader counting positions in a parallel list.
     """
 
     id: str
     turns: Sequence[str]
     checks: Sequence[Check] = ()
+    #: Turn index → the checks that turn must pass, applied as that turn
+    #: completes. A turn with no entry is asserted on by nothing, exactly as
+    #: before; ``checks`` is unaffected and still judges the last turn.
+    turn_checks: Mapping[int, Sequence[Check]] = field(default_factory=dict)
     #: Free text, printed next to a failure. Why this case is in the set at
     #: all, which is the thing nobody remembers six months later.
     note: str = ""
+
+    def checks_for(self, turn: int) -> Sequence[Check]:
+        """The per-turn checks declared for ``turn``, if any."""
+        return self.turn_checks.get(turn, ())
+
+    def all_checks(self) -> list[Check]:
+        """Every check the case declares, per-turn ones included.
+
+        The denominator an errored case still owes — see `runner`'s second rule.
+        """
+        return [*self.checks, *(c for turn in self.turn_checks.values() for c in turn)]
 
 
 @dataclass(frozen=True)

@@ -23,13 +23,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import httpx
 
 from trail.evals.cases import (
     Case,
     CaseOutcome,
+    Check,
     CheckResult,
     Finding,
     GoldenSet,
@@ -98,17 +99,26 @@ async def drive_turn(
 
 
 async def apply_checks(
-    case: Case, obs: Observation
+    case: Case,
+    obs: Observation,
+    checks: Sequence[Check] | None = None,
+    *,
+    label: str = "",
 ) -> tuple[list[Finding], list[CheckResult]]:
     """Run every check against ``obs``, awaiting the ones that are coroutines.
 
     This is the seam the whole design turns on. A deterministic check returns a
     list; a judge check returns a coroutine that resolves to one. Neither knows
     about the other, and a case is free to declare one, the other, or both.
+
+    ``checks`` defaults to the case's last-turn checks; the per-turn ones are
+    passed in explicitly with a ``label`` so that a result listing says which
+    turn a check belonged to. The findings need no such help — a
+    :class:`Finding` already carries ``obs.turn``.
     """
     findings: list[Finding] = []
     results: list[CheckResult] = []
-    for check in case.checks:
+    for check in case.checks if checks is None else checks:
         try:
             produced = check.run(obs)
             if inspect.isawaitable(produced):
@@ -132,7 +142,9 @@ async def apply_checks(
             ]
         findings.extend(produced)
         results.append(
-            CheckResult(name=check.name, metric=check.metric, passed=not produced)
+            CheckResult(
+                name=f"{label}{check.name}", metric=check.metric, passed=not produced
+            )
         )
     return findings, results
 
@@ -158,7 +170,8 @@ def _failed_everything(case: Case, obs: Observation, reason: str) -> CaseOutcome
             )
         ],
         checks=[
-            CheckResult(name=c.name, metric=c.metric, passed=False) for c in case.checks
+            CheckResult(name=c.name, metric=c.metric, passed=False)
+            for c in case.all_checks()
         ],
     )
 
@@ -178,6 +191,8 @@ async def run_case(client: httpx.AsyncClient, case: Case) -> CaseOutcome:
         opened.raise_for_status()
         thread_id = opened.json()["thread_id"]
 
+        findings: list[Finding] = []
+        results: list[CheckResult] = []
         for index, question in enumerate(case.turns):
             obs = await drive_turn(client, thread_id, case.id, index, question)
             observations.append(obs)
@@ -185,10 +200,19 @@ async def run_case(client: httpx.AsyncClient, case: Case) -> CaseOutcome:
                 return _failed_everything(
                     case, obs, f"{obs.error.get('status')} {obs.error.get('detail')}"
                 )
+            # Whatever this turn had to be true *as it happened*. A regression
+            # in the middle of a conversation is invisible from the last turn.
+            turn_findings, turn_results = await apply_checks(
+                case, obs, case.checks_for(index), label=f"turno {index}: "
+            )
+            findings.extend(turn_findings)
+            results.extend(turn_results)
 
-        # The checks run against the last turn: a case's earlier turns exist to
+        # And `checks` against the last turn: a case's earlier turns exist to
         # build the context its final question is asked in.
-        findings, results = await apply_checks(case, observations[-1])
+        last_findings, last_results = await apply_checks(case, observations[-1])
+        findings.extend(last_findings)
+        results.extend(last_results)
         return CaseOutcome(
             case_id=case.id,
             observations=observations,

@@ -253,6 +253,107 @@ async def test_contains_is_case_folded_but_not_normalised() -> None:
 
 
 # --------------------------------------------------------------------------
+# Per-turn checks
+# --------------------------------------------------------------------------
+
+
+async def test_a_mid_conversation_regression_is_not_invisible() -> None:
+    """The last turn is fine and the case still fails, because turn 0 was not.
+
+    This is the whole point of ``turn_checks``: a case that confirms a transfer
+    on the second question is worthless if the first one already claimed the
+    money was gone, and reading only the last answer cannot see that.
+    """
+    client = agent(
+        **{
+            "manda 300 pra Renata": stream("pronto, já enviei os R$ 300,00"),
+            "sim, pode mandar": stream("transferência concluída", tools=("confirm",)),
+        }
+    )
+    case = Case(
+        id="pix",
+        turns=["manda 300 pra Renata", "sim, pode mandar"],
+        checks=[contains("concluída"), calls_tools("confirm")],
+        turn_checks={0: [not_contains("enviei")]},
+    )
+    async with client:
+        outcome = await run_case(client, case)
+
+    assert not outcome.passed
+    # The last turn's own checks all passed — only the intermediate one failed.
+    assert [f.kind for f in outcome.findings] == ["FABRICATION"]
+    # Attributable: the finding names the turn, not just the case.
+    assert (outcome.findings[0].case_id, outcome.findings[0].turn) == ("pix", 0)
+    assert [(c.name, c.passed) for c in outcome.checks] == [
+        ("turno 0: not_contains(enviei)", False),
+        ("contains(concluída)", True),
+        ("calls_tools(confirm)", True),
+    ]
+
+
+async def test_the_same_case_without_turn_checks_passes_unchanged() -> None:
+    """Backwards compatibility, stated as the contrast it is."""
+    client = agent(
+        **{
+            "manda 300 pra Renata": stream("pronto, já enviei os R$ 300,00"),
+            "sim, pode mandar": stream("transferência concluída", tools=("confirm",)),
+        }
+    )
+    case = Case(
+        id="pix",
+        turns=["manda 300 pra Renata", "sim, pode mandar"],
+        checks=[contains("concluída"), calls_tools("confirm")],
+    )
+    async with client:
+        outcome = await run_case(client, case)
+    assert outcome.passed
+    assert [c.name for c in outcome.checks] == [
+        "contains(concluída)",
+        "calls_tools(confirm)",
+    ]
+
+
+async def test_a_turn_check_passes_where_the_turn_is_right() -> None:
+    client = agent(
+        **{
+            "manda 300 pra Renata": stream("confirma o PIX de R$ 300,00?"),
+            "sim, pode mandar": stream("transferência concluída"),
+        }
+    )
+    case = Case(
+        id="pix_ok",
+        turns=["manda 300 pra Renata", "sim, pode mandar"],
+        checks=[contains("concluída")],
+        turn_checks={0: [not_contains("enviei"), contains("confirma")]},
+    )
+    async with client:
+        outcome = await run_case(client, case)
+    assert outcome.passed
+    assert all(c.passed for c in outcome.checks)
+    assert len(outcome.checks) == 3
+
+
+async def test_an_errored_case_fails_its_turn_checks_too() -> None:
+    """Same rule as ``checks``: the worst cases must not shrink a denominator."""
+    client = agent(
+        **{"quebra": stream("", error={"status": 502, "detail": "upstream"})}
+    )
+    case = Case(
+        id="boom",
+        turns=["quebra", "segunda"],
+        checks=[contains("x")],
+        turn_checks={0: [calls_tools("search_docs")]},
+    )
+    async with client:
+        outcome = await run_case(client, case)
+    assert outcome.errored
+    assert [(c.metric, c.passed) for c in outcome.checks] == [
+        ("", False),
+        ("grounding", False),
+    ]
+
+
+# --------------------------------------------------------------------------
 # Failure never leaves the denominator
 # --------------------------------------------------------------------------
 
