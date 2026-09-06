@@ -20,7 +20,7 @@ import pytest
 
 from tests.fakes import calls, says, scripted
 from trail.config import Settings
-from trail.runtime.agent import build_agent
+from trail.runtime.agent import build_agent, build_model
 from trail.runtime.checkpointers import open_persistence
 from trail.runtime.registry import load_spec
 from trail.runtime.turns import STAGE, TURN, run_turn
@@ -302,3 +302,47 @@ async def test_separate_threads_do_not_see_each_other(settings: Settings) -> Non
         other = await agent.aget_state({"configurable": {"thread_id": "y"}})
 
     assert [m.content for m in other.values["messages"]] == ["dois", "b"]
+
+
+# --------------------------------------------------------------------------
+# the provider seam
+# --------------------------------------------------------------------------
+
+
+def test_the_default_provider_is_still_openai(make_settings: Any) -> None:
+    """``TRAIL_LLM_PROVIDER`` unset builds exactly what it built before."""
+    model = build_model(make_settings())
+
+    assert type(model).__name__ == "ChatOpenAI"
+    assert model.model_name == "gpt-5.6-luna"
+
+
+def test_bedrock_constructs_without_network_or_a_trail_key(
+    make_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TRAIL_LLM_PROVIDER=bedrock_converse`` reaches Bedrock with no rewrite.
+
+    This is the whole point of the seam, so it is asserted on the object
+    ``init_chat_model`` actually returns rather than on a mock: a real
+    ``ChatBedrockConverse``, carrying the model id TRAIL composed and the token
+    cap TRAIL set. Nothing is patched — the AWS variables below are the ambient
+    credential chain a deployment would supply, and boto3 resolves them locally,
+    so no call leaves the machine and ``TRAIL_LLM_API_KEY`` is never consulted.
+
+    What it does *not* prove is that Bedrock accepts the model id or the
+    credentials; that is an integration concern and needs an account.
+    """
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "sa-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "unit-tests-never-call-aws")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unit-tests-never-call-aws")
+
+    settings = make_settings(
+        llm_provider="bedrock_converse",
+        model="anthropic.claude-3-5-sonnet-20240620-v1:0",
+        max_tokens=256,
+    )
+    model = build_model(settings)
+
+    assert type(model).__name__ == "ChatBedrockConverse"
+    assert model.model_id == "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    assert model.max_tokens == 256

@@ -50,11 +50,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `TRAIL_LLM_PROVIDER=bedrock_converse` needs LangChain's AWS integration, which
+# drags boto3 in behind it. An extra rather than a default dependency: an
+# OpenAI-compatible deployment — which is every one this repo ships — should not
+# pay for the AWS SDK in its image. Install with `uv sync --extra bedrock`.
+bedrock = [
+    "langchain-aws>=1.0",
+]
 dev = [
     "pytest>=9.1",
     "pytest-asyncio>=1.4",
     "pytest-cov>=7",
     "ruff>=0.16",
+    # The provider seam is asserted offline in the unit tier, so the Bedrock
+    # binding has to be importable there even though it is optional at runtime.
+    "langchain-aws>=1.0",
 ]
 
 [project.scripts]

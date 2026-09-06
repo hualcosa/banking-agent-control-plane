@@ -54,19 +54,23 @@ class AgentSpec:
 
 
 def build_model(settings: Settings) -> Any:
-    """The chat model for ``settings``, bound to an OpenAI-compatible endpoint.
+    """The chat model for ``settings``, as ``TRAIL_LLM_PROVIDER`` names it.
 
-    ``init_chat_model`` reaches any provider LangChain has an integration for.
-    Pinning the ``openai:`` prefix here is a portability choice rather than a
-    vendor one: OpenAI, Fireworks, Together, DeepInfra and DeepSeek all speak
-    that dialect, so moving between them is ``TRAIL_LLM_BASE_URL`` plus
-    ``TRAIL_MODEL`` and no code change.
+    ``init_chat_model`` reaches any provider LangChain has an integration for,
+    and the provider is a setting rather than a literal so that reaching one is
+    configuration and not a rewrite. The default stays ``openai``, which is a
+    portability choice rather than a vendor one: OpenAI, Fireworks, Together,
+    DeepInfra and DeepSeek all speak that dialect, so moving between them is
+    ``TRAIL_LLM_BASE_URL`` plus ``TRAIL_MODEL``. ``bedrock_converse`` is the
+    other one this repo installs (``uv sync --extra bedrock``); it authenticates
+    from the ambient AWS chain, so the key and base URL below would be arguments
+    ``ChatBedrockConverse`` has no field for and are sent only for ``openai``.
     """
     from langchain.chat_models import init_chat_model
 
-    kwargs: dict[str, Any] = {
-        "api_key": settings.llm_api_key.get_secret_value(),
-        "max_tokens": settings.max_tokens,
+    kwargs: dict[str, Any] = {"max_tokens": settings.max_tokens}
+    if settings.llm_provider == "openai":
+        kwargs["api_key"] = settings.llm_api_key.get_secret_value()
         # Passed explicitly, and the default of "none" is load-bearing. Left
         # unset, the integration sends a reasoning effort of its own, and a
         # reasoning model on /v1/chat/completions refuses function tools while
@@ -78,11 +82,10 @@ def build_model(settings: Settings) -> Any:
         # Every tool call in the agent fails with a 400 that names a parameter
         # this repository never chose to send. Raise TRAIL_EFFORT above "none"
         # only against a Responses-API endpoint.
-        "reasoning_effort": settings.effort,
-    }
-    if settings.llm_base_url:
-        kwargs["base_url"] = settings.llm_base_url
-    return init_chat_model(f"openai:{settings.model}", **kwargs)
+        kwargs["reasoning_effort"] = settings.effort
+        if settings.llm_base_url:
+            kwargs["base_url"] = settings.llm_base_url
+    return init_chat_model(f"{settings.llm_provider}:{settings.model}", **kwargs)
 
 
 def build_agent(

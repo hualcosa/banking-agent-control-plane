@@ -9,11 +9,12 @@ serialised: ``repr`` and ``str`` render it as ``**********``, and
 ``model_dump(mode="json")`` emits the same mask. Read it exactly once, at the
 call site, via ``settings.llm_api_key.get_secret_value()``.
 
-The model is reached through LangChain's ``init_chat_model``, bound to an
-OpenAI-compatible endpoint. That is a deliberate portability choice rather than
-a vendor one: OpenAI, Fireworks AI, Together AI, DeepInfra and DeepSeek all
-speak the same dialect, so moving between them is ``TRAIL_LLM_BASE_URL`` plus
-``TRAIL_MODEL`` and no code change.
+The model is reached through LangChain's ``init_chat_model``, bound by default
+to an OpenAI-compatible endpoint (``TRAIL_LLM_PROVIDER``). That default is a
+deliberate portability choice rather than a vendor one: OpenAI, Fireworks AI,
+Together AI, DeepInfra and DeepSeek all speak the same dialect, so moving
+between them is ``TRAIL_LLM_BASE_URL`` plus ``TRAIL_MODEL`` and no code change.
+Another provider entirely — Bedrock, say — is ``TRAIL_LLM_PROVIDER``.
 
 Three fields describe the *shape* of the agent rather than its credentials —
 ``guardrails``, ``checkpointer`` and ``agent``. They are the dials this
@@ -51,6 +52,15 @@ class Settings(BaseSettings):
     #: it — though no such descent has been run and published from this
     #: repository yet, so this is a choice and not yet a finding.
     model: str = "gpt-5.6-luna"
+
+    #: Which LangChain integration builds the model — the prefix in
+    #: ``init_chat_model("<provider>:<model>")``. ``openai`` covers every
+    #: OpenAI-compatible host (see ``llm_base_url``); ``bedrock_converse``
+    #: reaches Amazon Bedrock and authenticates from the ambient AWS chain
+    #: rather than ``llm_api_key``, so it needs ``uv sync --extra bedrock`` and
+    #: a region, not a key. Any other string LangChain knows works too, as long
+    #: as its integration package is installed.
+    llm_provider: str = "openai"
 
     #: ``None`` uses OpenAI's endpoint. Point it at another Responses-API host
     #: (Fireworks, Together, DeepInfra, api.deepseek.com) to swap providers
