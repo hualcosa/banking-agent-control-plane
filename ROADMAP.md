@@ -72,10 +72,12 @@ palavra. Sem meta de latência, o marco 4 não sabe que infra escolher.
 
 **Pergunta:** o V0 respeita a própria regra dele?
 
-**A resposta honesta é não.** Em `examples/banking/tools.py:157` é o LLM que
-repassa a aprovação de step-up. Isso quebra "o LLM nunca encosta no dinheiro".
-O primeiro relatório do projeto é sobre isso: onde o V0 errou, a correção e o
-teste que teria pegado.
+**A resposta honesta era não, em dois lugares.** O LLM repassava a aprovação de
+step-up (a tool `approve_step_up`), o que quebra "o LLM nunca encosta no
+dinheiro"; e `explain` não pedia contexto, então a trilha de auditoria — que
+contém o `confirmation_id`, token que `confirm` aceita — era legível de
+qualquer sessão. Os dois estão corrigidos (S1); o primeiro relatório do projeto
+é sobre eles: onde o V0 errou, a correção e o teste que teria pegado.
 
 **O que fazer** (a ordem interna importa: Postgres → identidade → step-up → regras BACEN —
 o step-up out-of-band só funciona com storage compartilhado):
@@ -83,10 +85,15 @@ o step-up out-of-band só funciona com storage compartilhado):
   é commitado em transação própria ANTES da chamada ao banco.
 - Identidade vem do canal, não do agente (`tools.py:16`).
 - Step-up vira canal out-of-band: `trail step-up <intent_id>` no CLI (processo
-  separado → Postgres compartilhado, a mesma estrutura de um callback de app);
-  apagar a tool `approve_step_up` (`tools.py:157`). O step-up passa a se amarrar
-  a `customer_id` + `intent_id` (cross-channel por natureza); `confirm` continua
-  amarrado à sessão — isso vira ADR e pré-paga o marco 5.
+  separado → Postgres compartilhado, a mesma estrutura de um callback de app).
+  A tool `approve_step_up` já foi apagada (S1) — até o CLI existir, um intent em
+  `AWAITING_STEP_UP` não tem saída pelo chat, e essa é a resposta certa. O
+  step-up passa a se amarrar a `customer_id` + `intent_id` (cross-channel por
+  natureza); `confirm` continua amarrado à sessão — isso vira ADR e pré-paga o
+  marco 5.
+- Ownership de leitura, feito em S1: `explain(ctx, intent_id)` devolve `[]` para
+  quem não abriu a trilha, e uma trilha emprestada é indistinguível de um id
+  inexistente.
 - TTL de confirmação e digest da ação amarrado à confirmação — sem esses campos,
   duas células da matriz do marco 3 ("confirmação velha", "ação mutada") são
   inexpressáveis.
@@ -227,9 +234,9 @@ no post 1 e depois só lê conteúdo.
 | # | Título de trabalho | Afirmação | Evidência | Marco(s) |
 |---|---|---|---|---|
 | 0 ★ | Por que um control plane | O LLM não pode ser dono do dinheiro | V0 rodando: `manda 300 pra Renata` → propose → confirm → execute | nenhum (V0 já existe) |
-| 1 | Onde o V0 errou | A regra do próprio projeto foi violada | `tools.py:157` + a correção + o teste que teria pegado | 1 + início do 2 |
+| 1 | Onde o V0 errou | A regra do próprio projeto foi violada | a tool que aprovava + a trilha que vazava o `confirmation_id`, as duas correções e os testes que teriam pegado | 1 + início do 2 |
 | 2 | Idempotência não é uma chave de dict | Crash no meio de um PIX não duplica dinheiro | Postgres + outbox + crash injection | fim do 2 + 3 |
-| 3 ★ | A matriz | As 5 invariantes sobrevivem a falha e adversário | `make eval` com N ≥ 100 por célula | 3 |
+| 3 ★ | A matriz | As 5 invariantes sobrevivem a falha e adversário | `make matrix` com N ≥ 100 por célula (o `make eval` com LLM, N ≈ 20, é tabela separada) | 3 |
 | 4 | Rodar às 3h da manhã | Isso opera em produção | deploy + runbook testado + ADR `sa-east-1` | 4 |
 | 5 | Voz custou N linhas | A abstração é independente de canal | `git diff --stat src/control_plane/` | 5 |
 | 6 ★ | O que eu colocaria em produção | Recomendação defensável | 3 benchmarks + índice de ADRs | 6 |
@@ -276,4 +283,6 @@ Perde a voz como história própria — o diff vira uma linha do post final.
 6. benchmarks + final   (3 medições, 1 recomendação)
 ```
 
-Próximo passo quando voltar: marco 1, começando por `docs/threat-model.md`.
+Próximo passo quando voltar: fechar o marco 1 — `docs/threat-model.md`, CI,
+regras BACEN — e então o seam de storage (marco 2). O plano de execução está em
+`docs/execution-plan.md`.
