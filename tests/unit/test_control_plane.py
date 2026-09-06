@@ -43,7 +43,7 @@ def pix(recipient: str, amount: str) -> ProposedPix:
 
 
 def kinds(plane: ControlPlane, intent_id: str) -> list[str]:
-    return [e.kind for e in plane.explain(intent_id)]
+    return [e.kind for e in plane.explain(CTX, intent_id)]
 
 
 # --------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def test_above_the_hard_limit_is_denied_by_name(plane: ControlPlane) -> None:
     out = plane.propose(CTX, pix("João", "9000"))
     assert out.status == "DENY"
     assert "limite" in out.message
-    policy = next(e for e in plane.explain(out.intent_id) if e.kind == "policy")
+    policy = next(e for e in plane.explain(CTX, out.intent_id) if e.kind == "policy")
     assert policy.detail["rule"] == "pix_hard_limit"
 
 
@@ -176,7 +176,7 @@ def test_the_ledger_records_who_confirmed_what_and_when(plane: ControlPlane) -> 
     proposed = plane.propose(CTX, pix("Renata", "300"))
     plane.confirm(CTX, proposed.confirmation_id)
     confirmation = next(
-        e for e in plane.explain(proposed.intent_id) if e.kind == "confirmation"
+        e for e in plane.explain(CTX, proposed.intent_id) if e.kind == "confirmation"
     )
     assert confirmation.detail["by"] == "cust_123"
     assert confirmation.detail["session"] == "thread-1"
@@ -208,6 +208,31 @@ def test_explain_reconstructs_the_whole_pipeline(plane: ControlPlane) -> None:
     )
 
 
+def test_a_trail_is_only_readable_by_the_principal_that_opened_it(
+    plane: ControlPlane,
+) -> None:
+    """The ledger holds the confirmation_id — a token ``confirm`` accepts."""
+    proposed = plane.propose(CTX, pix("Renata", "300"))
+    assert plane.explain(CTX, proposed.intent_id) != []
+    assert plane.explain(OTHER_SESSION, proposed.intent_id) == []
+    assert plane.explain(OTHER_CUSTOMER, proposed.intent_id) == []
+
+
+def test_a_read_trail_is_scoped_like_a_payment_trail(plane: ControlPlane) -> None:
+    out = plane.query(CTX, GetBalance())
+    assert plane.explain(CTX, out.intent_id) != []
+    assert plane.explain(OTHER_SESSION, out.intent_id) == []
+
+
+def test_an_unknown_id_and_a_borrowed_one_are_indistinguishable(
+    plane: ControlPlane,
+) -> None:
+    proposed = plane.propose(CTX, pix("Renata", "300"))
+    assert plane.explain(OTHER_SESSION, proposed.intent_id) == plane.explain(
+        OTHER_SESSION, "pix_nope"
+    )
+
+
 # --------------------------------------------------------------------------
 # step-up
 # --------------------------------------------------------------------------
@@ -236,7 +261,7 @@ def test_high_risk_triggers_step_up_below_the_amount_threshold(
     """New recipient + unusual amount: the risk engine, not the amount rule."""
     out = plane.propose(CTX, pix("João", "600"))
     assert out.status == "REQUIRE_STEP_UP_AUTH"
-    risk = next(e for e in plane.explain(out.intent_id) if e.kind == "risk")
+    risk = next(e for e in plane.explain(CTX, out.intent_id) if e.kind == "risk")
     assert set(risk.detail["signals"]) == {"new_recipient", "unusual_amount"}
     assert risk.detail["level"] == "high"
 

@@ -14,7 +14,8 @@ that and ask the bank later (see ``plane.reconcile``). Treating a timeout as
 
 The :class:`Ledger` is append-only and holds two things: state transitions
 and pipeline events (what was interpreted, what policy said, who confirmed).
-``explain(intent_id)`` reads it back in order. That reading — not the model's
+``plane.explain(ctx, intent_id)`` reads it back in order, for the
+principal that wrote it. That reading — not the model's
 chain of thought — is the answer to "why did this action happen".
 
 # ponytail: in-process dicts and lists. Swap for two Postgres tables

@@ -187,14 +187,34 @@ def test_a_tool_without_a_thread_still_has_a_session() -> None:
 def test_the_remaining_tools_round_trip(fresh_plane: ControlPlane) -> None:
     rt = _Runtime()
     assert '"transactions"' in tools.get_card_transactions(rt, days=2)
-    proposed = tools.propose_pix(rt, "Renata", "1500")
-    assert '"REQUIRE_STEP_UP_AUTH"' in proposed
+    proposed = tools.propose_pix(rt, "Renata", "300")
+    assert '"REQUIRE_CONFIRMATION"' in proposed
     (intent,) = fresh_plane.intents.values()
-    assert '"REQUIRE_CONFIRMATION"' in tools.approve_step_up(rt, intent.id)
     assert '"CANCELLED"' in tools.cancel_pix(rt, intent.confirmation_id)
     assert '"CANCELLED"' in tools.check_pix(rt, intent.id)
-    assert '"policy"' in tools.explain_action(intent.id)
-    assert '"nenhum registro"' in tools.explain_action("pix_nope")
+    assert '"policy"' in tools.explain_action(rt, intent.id)
+    assert '"nenhum registro"' in tools.explain_action(rt, "pix_nope")
+
+
+def test_no_tool_can_grant_assurance(fresh_plane: ControlPlane) -> None:
+    """Step-up is out of band. A sentence from the model is not a factor."""
+    rt = _Runtime()
+    assert '"REQUIRE_STEP_UP_AUTH"' in tools.propose_pix(rt, "João", "1500")
+    (intent,) = fresh_plane.intents.values()
+    assert intent.state == "AWAITING_STEP_UP"
+    assert not any(name.endswith("step_up") for name in dir(tools))
+    assert all(tool.__name__ != "approve_step_up" for tool in tools.TOOLS)
+    assert intent.context.assurance != "strong"
+
+
+def test_a_trail_from_another_thread_reads_as_nothing(
+    fresh_plane: ControlPlane,
+) -> None:
+    mine, theirs = _Runtime("t1"), _Runtime("t2")
+    tools.propose_pix(mine, "Renata", "300")
+    (intent,) = fresh_plane.intents.values()
+    assert '"confirmation_id"' in tools.explain_action(mine, intent.id)
+    assert '"nenhum registro"' in tools.explain_action(theirs, intent.id)
 
 
 # --------------------------------------------------------------------------

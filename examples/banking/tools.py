@@ -6,6 +6,12 @@ token; the bank is reached only inside ``ControlPlane._execute``, which no
 tool can call. That is the boundary, enforced by import structure rather than
 by prompt.
 
+Nor is there a tool that *approves* anything. Step-up assurance is granted out
+of band — by the channel that can actually authenticate the customer — and the
+model is not that channel: a tool it can call to say "the customer approved" is
+a tool that lets a sentence stand in for an authentication factor. So
+``ControlPlane.step_up`` exists and nothing in this list reaches it.
+
 Results are JSON so the model relays fields rather than paraphrasing them. A
 ``status`` the model did not receive is a status it cannot truthfully claim.
 
@@ -144,21 +150,6 @@ def cancel_pix(runtime: ToolRuntime, confirmation_id: str) -> str:
     return _render(PLANE.cancel(context_for(runtime), confirmation_id))
 
 
-def approve_step_up(runtime: ToolRuntime, intent_id: str) -> str:
-    """Registra que o cliente aprovou a ação no aplicativo (simulado na V0).
-
-    Chame SOMENTE depois de o cliente dizer que aprovou no aplicativo. Devolve
-    o próximo passo — normalmente ``REQUIRE_CONFIRMATION`` com um
-    ``confirmation_id`` novo.
-
-    Args:
-        intent_id: O ``intent_id`` devolvido por ``propose_pix``.
-    """
-    # ponytail: the LLM relays the approval. In V1 this is a webhook from the
-    # mobile app and disappears from the tool list entirely.
-    return _render(PLANE.step_up(context_for(runtime), intent_id))
-
-
 def check_pix(runtime: ToolRuntime, intent_id: str) -> str:
     """Consulta o estado de um PIX; se estava ``UNKNOWN``, reconcilia com o banco.
 
@@ -168,14 +159,17 @@ def check_pix(runtime: ToolRuntime, intent_id: str) -> str:
     return _render(PLANE.reconcile(context_for(runtime), intent_id))
 
 
-def explain_action(intent_id: str) -> str:
+def explain_action(runtime: ToolRuntime, intent_id: str) -> str:
     """A trilha de auditoria de uma ação: cada evento registrado, em ordem.
+
+    Só devolve o que pertence a esta conversa.
 
     Args:
         intent_id: O ``intent_id`` de um PIX ou o id de uma consulta.
     """
     events: list[dict[str, Any]] = [
-        e.model_dump(mode="json") for e in PLANE.explain(intent_id)
+        e.model_dump(mode="json")
+        for e in PLANE.explain(context_for(runtime), intent_id)
     ]
     if not events:
         return json.dumps(
@@ -190,7 +184,6 @@ TOOLS = [
     propose_pix,
     confirm_pix,
     cancel_pix,
-    approve_step_up,
     check_pix,
     explain_action,
 ]

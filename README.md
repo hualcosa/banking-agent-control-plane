@@ -90,9 +90,11 @@ review rather than a prompt edit.
   made-up one, or one from another conversation, is `DENY` with nothing moved.
 * A timeout leaves `UNKNOWN`, a second confirm still pays nothing, `reconcile` finds the receipt.
 * Two contacts named Ana come back as a question. A PIX over the limit is refused by rule name.
-* `explain(intent_id)` returns the persisted chain: request → interpreted → resolution →
+* `explain(ctx, intent_id)` returns the persisted chain: request → interpreted → resolution →
   canonical_action → risk → policy → confirmation → authorization → execution_request →
-  backend_response.
+  backend_response — and returns it only to the customer **and** thread that opened it. The
+  trail holds the `confirmation_id`, so an unscoped audit read is a way to borrow a "yes";
+  from another conversation the answer is `[]`, the same answer an id that never existed gets.
 
 ### Demo tripwires
 
@@ -100,18 +102,21 @@ Deliberate, so the interesting paths are reachable from a chat:
 
 * **Ana** matches two contacts → `REQUIRE_MORE_INFO`.
 * **João** has never been paid; > R$ 500 to him is `high` risk → step-up below the amount threshold.
+  The assistant stops there on purpose: step-up is granted out of band, and V0 ships no channel
+  that can grant it.
 * An amount whose cents are **.13** (e.g. `300,13`) is paid *and then* times out → `UNKNOWN`;
   ask the assistant to check and it reconciles.
 * The card has an **iFood R$ 129,00** charge dated yesterday.
 
 ### The agent (`examples/banking/`)
 
-Eight tools, each a thin call into the plane; none can reach the bank. `approve_step_up` is the one
-that would not exist in V1 — it stands in for the mobile app's out-of-band approval, and says so.
-The system prompt is short because the rules that matter are not in it: it makes the model a
+Seven tools, each a thin call into the plane; none can reach the bank, and none can *approve*
+anything: `ControlPlane.step_up` exists and no tool reaches it, because a tool the model can call
+to report "the customer approved" lets a sentence stand in for an authentication factor. The
+system prompt is short because the rules that matter are not in it: it makes the model a
 faithful relay of the `status` it received, and forbids claiming a payment without a `COMPLETED`.
 
-`make chat` talks to it. `make eval` runs `examples/banking/golden.py` — ten cases, thresholds
+`make chat` talks to it. `make eval` runs `examples/banking/golden.py` — eleven cases, thresholds
 pre-registered, two of them zero-tolerance policy (a claimed payment that did not happen; a blocked
 benign question).
 
@@ -484,7 +489,7 @@ src/trail/
     store.py                  eval_runs · eval_findings, and the baseline lookup
     report.py                 The terminal scorecard: violations first, then numbers
 
-examples/banking/             The default agent. Eight tools, each a call into the control plane
+examples/banking/             The default agent. Seven tools, each a call into the control plane
   agent.py                    The AgentSpec: a relay prompt, the tools, injection + secret-leak gates
   tools.py                    propose_pix · confirm_pix · … — JSON in, JSON out, no bank access
   golden.py                   Ten cases, two zero-tolerance

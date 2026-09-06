@@ -11,7 +11,8 @@ shape of the boundary:
   execution gateway (:meth:`_execute`);
 * a timeout leaves the intent ``UNKNOWN`` and :meth:`reconcile` resolves it by
   asking the bank, never by paying again;
-* :meth:`explain` reads the ledger back, which is the audit answer.
+* :meth:`explain` reads the ledger back — for the principal that wrote it,
+  never for another — which is the audit answer.
 
 Every method takes a :class:`Context` and every intent remembers the one that
 created it. A confirmation is honoured only from the same customer **and** the
@@ -285,9 +286,18 @@ class ControlPlane:
         intent = self._owned(ctx, intent_id)
         return self._unknown(intent_id) if intent is None else self._status(intent)
 
-    def explain(self, intent_id: str) -> list[Event]:
-        """The audit trail: every persisted event for one intent, in order."""
-        return self.ledger.for_intent(intent_id)
+    def explain(self, ctx: Context, intent_id: str) -> list[Event]:
+        """The audit trail: every persisted event for one intent, in order.
+
+        Scoped like every other method here. The ledger itself names the
+        principal that opened the trail, so a read id is protected on the same
+        terms as a PIX, and a trail that belongs to someone else is
+        indistinguishable from one that never existed: both are ``[]``.
+        """
+        events = self.ledger.for_intent(intent_id)
+        if self._principal_of(events) != (ctx.customer_id, ctx.session_id):
+            return []
+        return events
 
     # ----------------------------------------------------------------------
     # internals
@@ -446,6 +456,19 @@ class ControlPlane:
                 intent, ctx
             ):
                 return intent
+        return None
+
+    @staticmethod
+    def _principal_of(events: list[Event]) -> tuple[str, str] | None:
+        """Who opened this trail, from the first event that says so.
+
+        Every path into the ledger starts with a ``request`` event carrying
+        :meth:`_who`; an id with no such event is nobody's.
+        """
+        for event in events:
+            detail = event.detail
+            if "customer" in detail and "session" in detail:
+                return str(detail["customer"]), str(detail["session"])
         return None
 
     @staticmethod
