@@ -24,7 +24,7 @@ same session — a "yes" cannot be borrowed across conversations.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -47,11 +47,11 @@ from control_plane.state import (
     Event,
     IllegalTransition,
     Intent,
-    Ledger,
     new_id,
     now,
     transition,
 )
+from control_plane.store import MemoryStore, Store
 
 Status = Decision | Literal["COMPLETED", "FAILED", "CANCELLED", "UNKNOWN", "PENDING"]
 
@@ -92,11 +92,21 @@ class ControlPlane:
         bank: MockBank | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
+        store: Store | None = None,
     ) -> None:
         self.bank = bank if bank is not None else MockBank()
         self.clock = clock if clock is not None else now
-        self.ledger = Ledger()
-        self.intents: dict[str, Intent] = {}
+        self.store: Store = store if store is not None else MemoryStore()
+
+    @property
+    def intents(self) -> Mapping[str, Intent]:
+        """Every live intent, read-only. Writes go through the store."""
+        return self.store.snapshot()
+
+    @property
+    def ledger(self) -> Store:
+        """The append-only event sink. Named for what it is, not where it lives."""
+        return self.store
 
     # ----------------------------------------------------------------------
     # reads
@@ -104,12 +114,12 @@ class ControlPlane:
 
     def query(self, ctx: Context, action: ReadAction) -> Outcome:
         rid = new_id("read")
-        self.ledger.append(
+        self.store.append(
             rid, "request", **self._who(ctx), action=action.model_dump(mode="json")
         )
         cap = capability(action)
         if ASSURANCE_RANK[ctx.assurance] < ASSURANCE_RANK[cap.required_assurance]:
-            self.ledger.append(rid, "result", status="DENY", rule="read_assurance")
+            self.store.append(rid, "result", status="DENY", rule="read_assurance")
             return Outcome(
                 status="DENY", message="sessão sem garantia suficiente", intent_id=rid
             )
@@ -137,7 +147,7 @@ class ControlPlane:
                     for t in self.bank.card_transactions(action.days)
                 ],
             }
-        self.ledger.append(rid, "result", status="ALLOW")
+        self.store.append(rid, "result", status="ALLOW")
         return Outcome(status="ALLOW", message="", intent_id=rid, data=data)
 
     # ----------------------------------------------------------------------
@@ -153,14 +163,14 @@ class ControlPlane:
         with a ``confirmation_id`` — a token that names one immutable action.
         """
         intent_id = new_id("pix")
-        self.ledger.append(intent_id, "request", **self._who(ctx), text=request_text)
-        self.ledger.append(
+        self.store.append(intent_id, "request", **self._who(ctx), text=request_text)
+        self.store.append(
             intent_id, "interpreted", proposed=proposed.model_dump(mode="json")
         )
 
         # 1. entity resolution — fail closed on anything but exactly one match
         matches = self.bank.find_contacts(proposed.recipient)
-        self.ledger.append(
+        self.store.append(
             intent_id,
             "resolution",
             query=proposed.recipient,
@@ -190,15 +200,15 @@ class ControlPlane:
             currency=proposed.currency,
         )
         intent = Intent(id=intent_id, action=action, context=ctx)
-        self.intents[intent.id] = intent
-        self.ledger.append(
+        self.store.put(intent)
+        self.store.append(
             intent.id, "canonical_action", action=action.model_dump(mode="json")
         )
 
         # 3. preconditions
         missing = self._missing_preconditions(intent)
         if missing:
-            transition(intent, "reject", self.ledger, reason="preconditions")
+            self._move(intent, "reject", reason="preconditions")
             intent.reason = ", ".join(missing)
             return Outcome(
                 status="DENY",
@@ -206,7 +216,7 @@ class ControlPlane:
                 intent_id=intent.id,
                 data={"missing_preconditions": missing},
             )
-        transition(intent, "validate", self.ledger)
+        self._move(intent, "validate")
 
         return self._decide(intent)
 
@@ -225,13 +235,14 @@ class ControlPlane:
                 intent, "essa ação não está aguardando autenticação", status="DENY"
             )
         intent.context = intent.context.model_copy(update={"assurance": "strong"})
-        self.ledger.append(
+        self.store.put(intent)
+        self.store.append(
             intent.id,
             "step_up",
             method="simulated_mobile_biometric",
             at=now().isoformat(),
         )
-        transition(intent, "step_up", self.ledger)
+        self._move(intent, "step_up")
         return self._decide(intent)
 
     def confirm(self, ctx: Context, confirmation_id: str) -> Outcome:
@@ -241,16 +252,17 @@ class ControlPlane:
             return self._unknown(confirmation_id)
         if intent.state in ("COMPLETED", "SUBMITTED", "PENDING", "UNKNOWN"):
             # The agent repeated itself. Money does not.
-            self.ledger.append(intent.id, "duplicate_confirmation", state=intent.state)
+            self.store.append(intent.id, "duplicate_confirmation", state=intent.state)
             return self._status(intent, "já executado; nenhum novo pagamento foi feito")
         if intent.state != "AWAITING_CONFIRMATION":
             return self._status(
                 intent, "essa ação não está aguardando confirmação", status="DENY"
             )
 
-        intent.confirmed_at = now()
+        intent.confirmed_at = self.clock()
         intent.confirmed_by = ctx.customer_id
-        self.ledger.append(
+        self.store.put(intent)
+        self.store.append(
             intent.id,
             "confirmation",
             confirmation_id=confirmation_id,
@@ -260,8 +272,8 @@ class ControlPlane:
             at=intent.confirmed_at.isoformat(),
             action=intent.action.model_dump(mode="json"),
         )
-        transition(intent, "confirm", self.ledger)
-        self.ledger.append(
+        self._move(intent, "confirm")
+        self.store.append(
             intent.id, "authorization", assurance=intent.context.assurance
         )
         return self._execute(intent)
@@ -271,12 +283,13 @@ class ControlPlane:
         if intent is None:
             return self._unknown(confirmation_id)
         try:
-            transition(intent, "cancel", self.ledger, by=ctx.customer_id)
+            self._move(intent, "cancel", by=ctx.customer_id)
         except IllegalTransition:
             return self._status(
                 intent, "essa ação não pode mais ser cancelada", status="DENY"
             )
         intent.reason = "cancelado pelo cliente"
+        self.store.put(intent)
         return self._status(intent, intent.reason)
 
     def reconcile(self, ctx: Context, intent_id: str) -> Outcome:
@@ -287,15 +300,14 @@ class ControlPlane:
         if intent.state != "UNKNOWN":
             return self._status(intent)
         receipt = self.bank.payment(intent.idempotency_key)
-        self.ledger.append(intent.id, "reconciliation", found=receipt is not None)
+        self.store.append(intent.id, "reconciliation", found=receipt is not None)
         if receipt is None:
-            transition(
-                intent, "fail", self.ledger, reason="banco não registrou o pagamento"
-            )
+            self._move(intent, "fail", reason="banco não registrou o pagamento")
             intent.reason = "não executado"
+            self.store.put(intent)
             return self._status(intent, intent.reason)
         intent.receipt = receipt
-        transition(intent, "complete", self.ledger, reconciled=True)
+        self._move(intent, "complete", reconciled=True)
         return self._status(intent, "confirmado junto ao banco: o pagamento foi feito")
 
     def status(self, ctx: Context, intent_id: str) -> Outcome:
@@ -310,7 +322,7 @@ class ControlPlane:
         terms as a PIX, and a trail that belongs to someone else is
         indistinguishable from one that never existed: both are ``[]``.
         """
-        events = self.ledger.for_intent(intent_id)
+        events = self.store.events_for(intent_id)
         if self._principal_of(events) != (ctx.customer_id, ctx.session_id):
             return []
         return events
@@ -319,12 +331,23 @@ class ControlPlane:
     # internals
     # ----------------------------------------------------------------------
 
+    def _move(self, intent: Intent, event: str, **detail: Any) -> Intent:
+        """One hop of the state machine, then saved.
+
+        Never call :func:`transition` directly from here: moving an intent and
+        recording where it moved to are one operation, and a store that only
+        sees half of it is a store that loses money on the next restart.
+        """
+        transition(intent, event, self.store, **detail)
+        self.store.put(intent)
+        return intent
+
     def _decide(self, intent: Intent) -> Outcome:
         """Risk, then policy, then the transition policy asked for."""
         risk = assess_risk(
             intent.action, intent.context, known_recipients=self.bank.paid_before
         )
-        self.ledger.append(
+        self.store.append(
             intent.id,
             "risk",
             score=risk.score,
@@ -332,7 +355,7 @@ class ControlPlane:
             signals=list(risk.signals),
         )
         verdict = evaluate(intent.action, intent.context, risk, now=self.clock())
-        self.ledger.append(
+        self.store.append(
             intent.id,
             "policy",
             decision=verdict.decision,
@@ -343,11 +366,12 @@ class ControlPlane:
 
     def _apply(self, intent: Intent, verdict: Verdict) -> Outcome:
         if verdict.decision == "DENY":
-            transition(intent, "reject", self.ledger, rule=verdict.rule)
+            self._move(intent, "reject", rule=verdict.rule)
             intent.reason = verdict.reason
+            self.store.put(intent)
             return self._status(intent, verdict.reason, status="DENY")
         if verdict.decision == "REQUIRE_STEP_UP_AUTH":
-            transition(intent, "require_step_up", self.ledger, rule=verdict.rule)
+            self._move(intent, "require_step_up", rule=verdict.rule)
             return Outcome(
                 status="REQUIRE_STEP_UP_AUTH",
                 message=verdict.reason,
@@ -356,11 +380,8 @@ class ControlPlane:
             )
         if verdict.decision == "REQUIRE_CONFIRMATION":
             intent.confirmation_id = new_id("conf")
-            transition(
-                intent,
-                "await_confirmation",
-                self.ledger,
-                confirmation_id=intent.confirmation_id,
+            self._move(
+                intent, "await_confirmation", confirmation_id=intent.confirmation_id
             )
             return Outcome(
                 status="REQUIRE_CONFIRMATION",
@@ -371,14 +392,14 @@ class ControlPlane:
             )
         # ALLOW / ESCALATE for a write are not in V0's rule set. Fail closed:
         # an unexpected verdict on a money path stops rather than guesses.
-        transition(intent, "reject", self.ledger, rule=verdict.rule)
+        self._move(intent, "reject", rule=verdict.rule)
         intent.reason = f"decisão sem caminho de execução: {verdict.decision}"
         return self._status(intent, intent.reason, status="DENY")
 
     def _execute(self, intent: Intent) -> Outcome:
         """The execution gateway. The one place the bank is asked to move money."""
-        transition(intent, "submit", self.ledger)
-        self.ledger.append(
+        self._move(intent, "submit")
+        self.store.append(
             intent.id, "execution_request", idempotency_key=intent.idempotency_key
         )
         try:
@@ -389,20 +410,20 @@ class ControlPlane:
                 amount=intent.action.amount,
             )
         except BankTimeout as exc:
-            self.ledger.append(intent.id, "backend_response", error=str(exc))
-            transition(intent, "timeout", self.ledger)
+            self.store.append(intent.id, "backend_response", error=str(exc))
+            self._move(intent, "timeout")
             return self._status(
                 intent,
                 "sem resposta do banco; o pagamento pode ter sido feito — verifique antes de repetir",
             )
         except BankError as exc:
-            self.ledger.append(intent.id, "backend_response", error=str(exc))
-            transition(intent, "fail", self.ledger, reason=str(exc))
+            self.store.append(intent.id, "backend_response", error=str(exc))
+            self._move(intent, "fail", reason=str(exc))
             intent.reason = str(exc)
             return self._status(intent, str(exc))
         intent.receipt = receipt
-        self.ledger.append(intent.id, "backend_response", receipt=receipt)
-        transition(intent, "complete", self.ledger)
+        self.store.append(intent.id, "backend_response", receipt=receipt)
+        self._move(intent, "complete")
         return self._status(intent, "pagamento concluído")
 
     def _missing_preconditions(self, intent: Intent) -> list[str]:
@@ -461,18 +482,16 @@ class ControlPlane:
         )
 
     def _owned(self, ctx: Context, intent_id: str) -> Intent | None:
-        intent = self.intents.get(intent_id)
+        intent = self.store.get(intent_id)
         if intent is None or not self._same_principal(intent, ctx):
             return None
         return intent
 
     def _by_confirmation(self, ctx: Context, confirmation_id: str) -> Intent | None:
-        for intent in self.intents.values():
-            if intent.confirmation_id == confirmation_id and self._same_principal(
-                intent, ctx
-            ):
-                return intent
-        return None
+        intent = self.store.by_confirmation(confirmation_id)
+        if intent is None or not self._same_principal(intent, ctx):
+            return None
+        return intent
 
     @staticmethod
     def _principal_of(events: list[Event]) -> tuple[str, str] | None:

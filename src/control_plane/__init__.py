@@ -13,6 +13,7 @@ from control_plane.actions import (
 from control_plane.bank import MockBank
 from control_plane.plane import ControlPlane, Outcome, brl
 from control_plane.state import Event, IllegalTransition, Intent, Ledger
+from control_plane.store import MemoryStore, Store
 
 __all__ = [
     "Context",
@@ -24,8 +25,10 @@ __all__ = [
     "IllegalTransition",
     "Intent",
     "Ledger",
+    "MemoryStore",
     "MockBank",
     "Outcome",
     "ProposedPix",
+    "Store",
     "brl",
 ]
