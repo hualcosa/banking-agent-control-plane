@@ -13,17 +13,31 @@ O gateway **executa**. O LLM nunca encosta no dinheiro diretamente.
 linguagem natural → LLM → ação tipada → regras determinísticas → banco
 ```
 
-## O que já existe (V0, commit f946c70)
+## Onde estamos (depois de S1–S5, 17 commits desde `f043ea3`)
 
-O `src/control_plane/` já tem: ações tipadas, máquina de estados, política,
-idempotência, ledger e reconciliação. Ou seja: os marcos 1–3 do plano original
-já estão feitos em versão simplificada. O que falta está marcado no código:
+| Marco | Estado | Evidência |
+|---|---|---|
+| 1 — ameaças e metas | **feito** | `docs/threat-model.md`, revisado em S5: 22 adversários, 18 com teste nomeado, 4 lacunas honestas |
+| 2 — endurecer o V1 | **feito** | `make lint && make test` (384 testes unitários, gate de 90%) + `make test-integration` (22 testes) |
+| 3 — evidência de falha | **feito** | `make matrix`: 5 invariantes × 11 cenários × N=100, sem LLM |
+| 4 — AWS + operação | **não começou** | o `docs/runbook.md` já existe (escrito em S5, junto do `trail intents`/`trail reconcile`), mas nunca foi executado contra produção porque não há produção |
+| 5 — voz | **em andamento agora** | — |
+| 6 — benchmarks e decisão final | não começou | — |
+
+O `src/control_plane/` tem ações tipadas, máquina de estados, política (com duas
+regras reais do BACEN e relógio injetado), idempotência, ledger, reconciliação,
+TTL de confirmação, digest da ação com chave, sweep de restart e um `Store` com
+implementação em Postgres. O que ainda é atalho está marcado no código:
 
 ```bash
 grep -rn "ponytail:" src examples
 ```
 
 Cada linha dessa lista é um atalho consciente do V0. Essa lista **é** o backlog do V1.
+Duas delas — identidade fixa e "estado só em dicts" — saíram da lista nos marcos
+2 e 3; a ressalva honesta é que o processo que serve o chat ainda monta o plane
+sobre `MemoryStore` (só o CLI abre o `PgStore`), então a durabilidade está
+provada no store e ainda não está ligada no serviço.
 
 ## As invariantes (o que nunca pode acontecer)
 
@@ -48,7 +62,7 @@ Regra de exceção: se um marco mostrar que a **abstração** precisa mudar
 
 ---
 
-## Marco 1 — Modelo de ameaças, invariantes e metas
+## Marco 1 — Modelo de ameaças, invariantes e metas · **FEITO (S1)**
 
 **Pergunta:** contra o que estamos nos defendendo, e o que significa "funciona"?
 
@@ -66,9 +80,15 @@ palavra. Sem meta de latência, o marco 4 não sabe que infra escolher.
 
 **Terminou quando:** existe `docs/threat-model.md` com tabela adversário → invariante → teste que vai provar.
 
+**Fechado.** O arquivo existe e é falsificável em um comando (o `grep` no fim
+dele). Revisado ao fim de S5: 22 linhas, 18 cobertas, 4 lacunas — A2 (nada
+screena saída de tool), A11 (fabricação no canal, medida com LLM), A14 (o recibo
+do banco nunca é conferido contra a ação confirmada) e A22 (endpoints de thread
+autenticam mas não escopam por cliente). Nenhuma tem tarefa no plano.
+
 ---
 
-## Marco 2 — Endurecer o V1
+## Marco 2 — Endurecer o V1 · **FEITO (S1–S4)**
 
 **Pergunta:** o V0 respeita a própria regra dele?
 
@@ -106,9 +126,36 @@ o step-up out-of-band só funciona com storage compartilhado):
 **Terminou quando:** o agente não tem mais nenhuma tool capaz de aprovar nada,
 e o control plane sobrevive a reiniciar o processo no meio de um PIX.
 
+**Fechado, item por item, com o comando que passa:**
+
+| Item | Onde ficou | Gate |
+|---|---|---|
+| `approve_step_up` apagada (S1) | `examples/banking/tools.py` | `test_no_tool_can_grant_assurance` |
+| `explain(ctx, …)` escopado (S1) | `plane.py:388` | trilha emprestada é indistinguível de id inexistente |
+| Regras BACEN + relógio injetado (S1) | `policy.py`, `pix_nighttime_limit` | `tests/unit/test_policy.py` com relógio fixo |
+| `Store` + `MemoryStore` (S2) | `control_plane/store.py` | os testes antigos passaram **sem edição** |
+| `intents` e `ledger_events` (S2) | `db/schema.sql` | aplica duas vezes limpo |
+| `PgStore` (S3) | `control_plane/pgstore.py` | `make test` ≥90% **e** `make test-integration` (22 testes) |
+| Identidade vinda do canal (S3) | `src/trail/identity.py`, header `X-Trail-Identity` | header forjado → 401 sem oráculo; dois clientes isolados de ponta a ponta |
+| Sweep de restart (S4) | `ControlPlane.sweep`, hook `AgentSpec.on_startup` | crash no meio do PIX → novo plane sobre o mesmo store → sweep → reconcile → **1 débito** |
+| TTL de confirmação + digest com chave (S4) | `state.py`, `plane.confirm` | expirada → `CANCELLED`; digest divergente → `DENY` |
+| Ownership: step-up e reconcile em cliente+intent, `confirm` na sessão (S4/S5) | `plane._owned_by_customer` | `test_step_up_is_bound_to_the_customer_not_the_session` · `test_consent_is_still_bound_to_the_conversation` |
+| Step-up out-of-band de verdade (S5) | `trail step-up <intent_id>` | `test_step_up_from_another_process_reaches_the_confirmation` |
+
+Fora do combinado, e vale registrar: CI roda `make lint` + `make test` em todo
+PR (S1), e o provedor de modelo virou setting (`TRAIL_LLM_PROVIDER`, com
+`langchain-aws` num extra `bedrock`) — o marco 4 não precisa de reescrita para
+falar com o Bedrock.
+
+**A ressalva honesta:** o `PgStore` está testado e é o que o CLI abre, mas o
+processo que serve o chat ainda constrói `ControlPlane()` sobre `MemoryStore`
+(`examples/banking/tools.py:56`). "Sobrevive a reiniciar o processo" está provado
+no store e na integração, não no serviço. Ligar os dois é uma tarefa pequena e
+não está feita.
+
 ---
 
-## Marco 3 — Evidência de falha
+## Marco 3 — Evidência de falha · **FEITO (S3–S5)**
 
 **Pergunta:** as invariantes sobrevivem a crash e a adversário?
 
@@ -131,11 +178,48 @@ imprime a matriz e todas as células de invariante estão verdes com N ≥ 100 e
 menos de um minuto. O comportamento do agente com LLM roda em `make eval`
 (N ≈ 20) e é reportado como tabela separada — nunca rotulado "invariante".
 
+**Fechado.** `make matrix` roda `tests/unit/test_invariants.py`: 5 invariantes ×
+11 cenários (happy, confirmação repetida, execução concorrente, crash depois de
+pagar, crash antes de pagar, timeout do banco, token emprestado, "sim" expirado,
+ação mutada, destinatário ambíguo, recusa do banco) × N=100 trials semeados por
+célula, em segundos, sem modelo. A injeção de crash abaixo do agente é o
+`FaultyBank` (`tests/fakes.py`), que levanta uma exceção que o plane **não**
+captura, antes ou depois do débito.
+
+Três decisões que vieram de bugs encontrados durante a construção, e que são o
+que faz o número significar alguma coisa:
+
+- **Débito é contado, não inferido.** `len(bank.payments)` afirmaria a garantia
+  do *banco* e passaria mesmo se o plane chamasse cinco vezes.
+- **Célula que não se aplica imprime `·`.** Forçar toda invariante em todo
+  cenário encheria a tabela de verde sem sentido.
+- **Mas uma célula não pode ficar em branco em silêncio.** `MUST_APPLY` fixa
+  quais invariantes cada cenário tem de alcançar de fato — uma rodada de mutação
+  que desligou o sweep transformou um `100/100` em `·` e a suíte continuou verde.
+
+A matriz foi mutation-tested: os checks foram rodados contra versões
+deliberadamente quebradas do plane, e os que ainda passavam foram reescritos.
+
+O golden set adversarial (acima do agente) ficou em `banking-v3`: 16 casos, 5
+adversariais, 3 multi-turno — possíveis porque `Case.turn_checks` checa cada
+turno, não só o último. Ele mede A2 e A11; não os fecha, e a tabela dele nunca é
+rotulada "invariante".
+
 ---
 
-## Marco 4 — Baseline em produção na AWS + operação
+## Marco 4 — Baseline em produção na AWS + operação · **NÃO COMEÇOU**
 
 **Pergunta:** alguém consegue rodar isso às 3 da manhã?
+
+**Estado:** nada de AWS existe — sem `infra-cdk/`, sem contrato
+`/invocations` + `/ping`, sem imagem arm64, sem ADR de residência. O marco é
+inteiro deploy e ainda não teve uma linha escrita.
+
+O que já existe deste marco é a metade operacional, adiantada em S5 porque o
+step-up out-of-band precisava dela: `docs/runbook.md` mais `trail intents`,
+`trail step-up` e `trail reconcile`. Um humano resolve um `UNKNOWN` só com o
+documento — **localmente**. O gate deste marco continua aberto, porque ele exige
+um `UNKNOWN` forçado em produção e não há produção.
 
 **O que fazer:**
 - Deploy real na stack enterprise-AI da AWS (revisado 2026-09-01 — é o nicho da

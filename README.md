@@ -260,7 +260,7 @@ Three pillars. The acronym is not decoration — it is the component list.
 |---|---|---|
 | **T·R** | **Traced Runtime** | An LLM+tools agent with **switchable input and output guardrails**, a swappable checkpointer, and a FastAPI service that streams every step of a turn as it happens. The loop is LangChain's `create_agent`; what TRAIL adds is the seam and the reporting. |
 | **I** | **Instrumentation** | OTel → OTLP/HTTP → self-hosted Langfuse, wired. Model calls arrive typed as **generations** with model, tokens and cost, not as anonymous spans. Trace deep links stamped onto API responses, so an answer is one click from the span that produced it. |
-| **L** | **…Locally** — and the golden set | An evaluation harness that drives your agent over HTTP, computes metrics against **pre-registered thresholds**, classifies failures into a taxonomy, and detects regression against a previous run. Cases compose deterministic checks and LLM-judge checks freely; the grader's tokens are tallied apart from the agent's, and a run graded by the agent's own model says so on the scorecard. |
+| **L** | **…Locally** — and the golden set | An evaluation harness that drives your agent over HTTP, computes metrics against **pre-registered thresholds**, classifies failures into a taxonomy, and detects regression against a previous run. Cases compose deterministic checks and LLM-judge checks freely, on the final turn or on **any** turn (`Case.turn_checks`, so a multi-turn case cannot pass by recovering at the end); the grader's tokens are tallied apart from the agent's, and a run graded by the agent's own model says so on the scorecard. |
 
 The fourth thing, which does not fit the acronym and matters as much: **a pipeline rail that shows
 the machinery rather than the tokens.** A guardrail that is switched off still reports itself,
@@ -430,7 +430,7 @@ trying to abstract the *agent*. The agent is exactly the part you should write y
 |---|---|
 | Your system prompt and your tools | The agent loop, the HTTP shell, and the SSE pipeline that reports every step of it |
 | Your **checks** — pure functions from text to a verdict | The **gates** that run them at the edges, short-circuit the turn with your fallback, and report themselves on the rail |
-| Your model choice | Token and cost accounting, span wrapping, and the attributes that make a call arrive in Langfuse as a typed generation |
+| Your model choice, and your provider — `TRAIL_LLM_PROVIDER` (`bedrock_converse` installs as an extra rather than a rewrite) | Token and cost accounting, span wrapping, and the attributes that make a call arrive in Langfuse as a typed generation |
 | Nothing about persistence | A checkpointer and a store as swappable slots: in memory for tests, in Postgres for anything a user comes back to |
 | Your golden set and your thresholds | The runner, the metrics engine, the failure taxonomy, regression detection, the report |
 
@@ -573,23 +573,30 @@ Each of these was argued and declined.
 README.md                     This file
 docker-compose.yml            The services
 Dockerfile                    One image, two roles
-Makefile                      The control surface: up · down · chat · eval · test · test-integration · lint · fmt · clean
+Makefile                      The control surface: up · down · chat · eval · test · matrix · test-integration · intents · reconcile · lint · fmt · clean
 .env.example                  Every variable, with its default and the reason for it
-db/schema.sql                 Two tables, and §4 says why only two
+db/schema.sql                 Four tables, and §4 says why those four
+.github/workflows/ci.yml      `make lint` then `make test`, on every pull request
+docs/threat-model.md          22 adversaries × invariant × the test that proves it, or the gap
+docs/execution-plan.md        The blueprint: tasks, sessions, gates — and what is done
+docs/runbook.md               What a person does with an intent in UNKNOWN
 
 src/control_plane/            The boundary. No framework, no bank SDK — see "The control plane" above
   actions.py                  Context, ProposedPix → CreatePix, the capability registry
-  policy.py                   Mocked risk signals and the ordered rule set
-  state.py                    Intent, TRANSITIONS, IllegalTransition, the append-only Ledger
+  policy.py                   Mocked risk signals, the ordered rule set, the BACEN nighttime window
+  state.py                    Intent, TRANSITIONS, IllegalTransition, the Ledger event, the TTL and the action digest
+  store.py                    The Store protocol and MemoryStore
+  pgstore.py                  PgStore: the same protocol over intents and ledger_events
   bank.py                     MockBank: idempotent create_pix, the .13 timeout, the reconciliation lookup
-  plane.py                    ControlPlane: propose · step_up · confirm · cancel · reconcile · explain
+  plane.py                    ControlPlane: propose · step_up · confirm · cancel · reconcile · sweep · explain
 
 src/trail/
   config.py                   pydantic-settings, TRAIL_ prefix — and the dials
+  identity.py                 The signed channel header: sign, verify, and one answer for every failure
   costs.py                    Per-model rates; an unpriced model costs None, never zero
   telemetry.py                OTel SDK → OTLP → Langfuse, and the trace deep links
-  app.py                      FastAPI: /threads, /threads/{id}/turns, /threads/{id}/turns/stream
-  cli.py                      trail chat · trail eval — one client, two ways to drive it
+  app.py                      FastAPI: /threads, /threads/{id}/turns, /threads/{id}/turns/stream — and the 401
+  cli.py                      trail chat · trail eval · trail intents · trail step-up · trail reconcile
   runtime/
     agent.py                  AgentSpec and build_agent: model + tools + gates + persistence
     registry.py               Which example is mounted, resolved from TRAIL_AGENT
@@ -611,13 +618,17 @@ src/trail/
 examples/banking/             The default agent. Seven tools, each a call into the control plane
   agent.py                    The AgentSpec: a relay prompt, the tools, injection + secret-leak gates
   tools.py                    propose_pix · confirm_pix · … — JSON in, JSON out, no bank access
-  golden.py                   Ten cases, two zero-tolerance
+  golden.py                   Sixteen cases (banking-v3), five adversarial, two zero-tolerance
 examples/trail_guide/         The agent that explains TRAIL. Two tools, three checks
   agent.py                    The AgentSpec: prompt, tools, GuardSpec
   tools.py                    search_docs · stack_status, both offline
   golden.py                   Its twelve cases and its pre-registered thresholds
 ui/                           The browser surface: Vite + React, DESIGN.md explains the rail
-tests/                        unit/ offline with coverage; integration/ behind a marker
+tests/                        unit/ offline with coverage; the matrix and integration/ behind markers
+  unit/test_invariants.py     `make matrix`: 5 invariants × 11 scenarios × N=100 seeded trials
+  unit/test_recovery.py       The sweep, the TTL and the action digest
+  unit/test_crash.py          What a crash mid-payment costs when nothing sweeps
+  fakes.py                    ScriptedModel, and FaultyBank — a bank that dies at a point you name
 ```
 
 ---
