@@ -117,3 +117,106 @@ CREATE TABLE IF NOT EXISTS eval_findings (
 
 CREATE INDEX IF NOT EXISTS eval_findings_run_idx  ON eval_findings (run_id);
 CREATE INDEX IF NOT EXISTS eval_findings_kind_idx ON eval_findings (kind);
+
+
+-- ---------------------------------------------------------------------------
+-- The control plane
+-- ---------------------------------------------------------------------------
+--
+-- Two tables, and the split between them is the whole design: `intents` is
+-- mutable current state, `ledger_events` is append-only history. Nothing ever
+-- updates or deletes a ledger row, which is what makes `explain` an audit
+-- answer rather than a report generated from whatever the state happens to be
+-- now.
+--
+-- These are TRAIL's own data with no upstream owner — the same test that let
+-- the eval tables in above. LangGraph owns conversation state; this owns money.
+
+CREATE TABLE IF NOT EXISTS intents (
+    -- The intent id IS the idempotency key sent to the bank. One intent, one
+    -- key, forever: a text primary key rather than a serial, because the value
+    -- is meaningful to a system outside this database and must not be
+    -- reassigned by it.
+    id              TEXT        PRIMARY KEY,
+
+    -- The principal that created it. Both halves are needed: a confirmation is
+    -- honoured only from the same customer AND the same session, so a lookup
+    -- that filters on one of them is a lookup that authorises too much.
+    customer_id     TEXT        NOT NULL,
+    session_id      TEXT        NOT NULL,
+    channel         TEXT        NOT NULL DEFAULT '',
+
+    -- The canonical action, as the plane built it — never as the model typed
+    -- it. JSONB because the action union grows (a scheduled PIX, a card block)
+    -- without a migration, and because no query here filters on its innards.
+    action          JSONB       NOT NULL,
+
+    -- The state machine's current node. Unconstrained by CHECK on purpose: the
+    -- transition table in `state.py` is the authority, and a second copy of it
+    -- here would be a copy that drifts. The database stores where the machine
+    -- is; it does not adjudicate where it may go.
+    state           TEXT        NOT NULL,
+
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- The token the customer confirms, and when. Nullable until the intent
+    -- reaches AWAITING_CONFIRMATION. `confirmed_at` exists so a confirmation
+    -- can expire (T8) — a column written and never read is exactly how "old
+    -- confirmation" became unexpressable in V0.
+    confirmation_id TEXT,
+    confirmed_at    TIMESTAMPTZ,
+    confirmed_by    TEXT,
+
+    -- What the bank answered. NULL until SUBMITTED resolves — and NULL while
+    -- UNKNOWN, which is the state this column cannot describe and `reconcile`
+    -- exists to settle.
+    receipt         JSONB,
+
+    -- Why a terminal state was reached, when it was not success.
+    reason          TEXT        NOT NULL DEFAULT ''
+);
+
+-- The restart sweep (T7) asks exactly one question: which intents did this
+-- process leave mid-flight? Partial index, because SUBMITTED is a vanishing
+-- fraction of the table and the sweep runs on every boot.
+CREATE INDEX IF NOT EXISTS intents_unsettled_idx
+    ON intents (state)
+    WHERE state IN ('SUBMITTED', 'AWAITING_CONFIRMATION', 'AWAITING_STEP_UP');
+
+-- Ownership lookups: "this customer's intents", never "this id, whoever owns it".
+CREATE INDEX IF NOT EXISTS intents_principal_idx
+    ON intents (customer_id, session_id);
+
+-- A confirmation_id must resolve to at most one intent, and must not be
+-- guessable into someone else's. Unique rather than merely indexed: two
+-- intents sharing a token is a bug that authorises a payment.
+CREATE UNIQUE INDEX IF NOT EXISTS intents_confirmation_idx
+    ON intents (confirmation_id)
+    WHERE confirmation_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ledger_events (
+    -- Sequence, not timestamp, is the order. Two events in the same
+    -- transaction can share a clock reading; `explain` still has to render
+    -- them in the order they happened.
+    seq        BIGSERIAL   PRIMARY KEY,
+    at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Deliberately NOT a foreign key to `intents`. A read (`read_…`) writes
+    -- events and never creates an intent, and the `execution_request` row is
+    -- committed in its own transaction before the bank is called — a
+    -- constraint here would make the outbox write depend on the row it is
+    -- meant to outlive.
+    intent_id  TEXT        NOT NULL,
+
+    kind       TEXT        NOT NULL,
+    detail     JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- `explain` is the only read: one intent's events, in order.
+CREATE INDEX IF NOT EXISTS ledger_events_intent_idx
+    ON ledger_events (intent_id, seq);
+
+-- The reconciliation sweep asks for execution_requests with no matching
+-- backend_response — a kind-filtered scan, so the kind is indexed.
+CREATE INDEX IF NOT EXISTS ledger_events_kind_idx
+    ON ledger_events (kind);
