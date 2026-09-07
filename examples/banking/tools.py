@@ -22,14 +22,22 @@ there. The customer is therefore something the agent is *told*, not something
 it decides — a constant in this module would be an identity a prompt could
 argue with, and the whole control plane scopes on it.
 
-# ponytail: one ControlPlane per process. V1 injects the plane per request.
+Scope, too, comes from the channel. ``PLANE`` is the *template* — the ledger,
+the clock, the secret, and a bank in its opening state — and each conversation
+gets a plane of its own over that same ledger, with a bank of its own. See
+``plane_for``.
+
+# ponytail: planes derived per conversation and kept in a process dict. V1
+# stores the account in Postgres and the scope is a row, not a key here.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from langchain.tools import ToolRuntime
 
@@ -42,7 +50,67 @@ from control_plane import (
     ProposedPix,
 )
 
+#: The template every conversation's plane is derived from. Still a module
+#: attribute, and still the thing a test replaces: swapping it swaps the bank,
+#: the clock and the ledger every scope is built over.
 PLANE = ControlPlane()
+
+#: ``template plane → {(customer, session): plane}``. Weak on the template so
+#: that replacing ``PLANE`` — a test's monkeypatch, a re-import — drops every
+#: scope derived from the old one instead of leaking it into the next caller.
+_SCOPES: WeakKeyDictionary[ControlPlane, dict[tuple[str, str], ControlPlane]] = (
+    WeakKeyDictionary()
+)
+_SCOPES_LOCK = threading.Lock()
+
+
+def plane_for(ctx: Context) -> ControlPlane:
+    """The plane for one conversation: shared ledger, bank of its own.
+
+    Two mutable things in :class:`~control_plane.bank.MockBank` are also policy
+    inputs — the balance, and ``paid_before``, which is where the
+    ``new_recipient`` risk signal comes from. One bank per process therefore
+    means the *second* payment to João scores differently from the first, and
+    that is not confined to one conversation: it survives across whole eval
+    runs in a long-lived container, so a second ``make eval`` scores something
+    the first one cannot be compared to.
+
+    The key is ``(customer, session)`` — a conversation. Per *customer* alone
+    would be the more natural banking scope, but every eval case authenticates
+    as the same customer (``trail.cli.identity_headers`` signs one id for the
+    whole run), so a per-customer bank would leave all cases, and all reruns,
+    sharing exactly the state that makes the run irreproducible. The session is
+    the unit the harness creates fresh per case and per run, which makes it the
+    only key that actually scopes them apart. The customer stays in the key so
+    that two principals in one thread id are still two accounts.
+
+    Nothing about the single-customer chat changes: one conversation is one
+    thread, so it is one account, continuous from the first turn to the last.
+
+    The ledger, the clock and the secret are the template's, shared: intents
+    are already scoped by their :class:`Context`, so the audit trail stays
+    whole (``sweep`` on boot still sees every stranded intent) while the bank —
+    the only state that leaks *outcomes* between callers — does not.
+
+    Nothing evicts: a bank is a few hundred bytes and an evicted one would
+    answer ``reconcile`` with "the bank never paid" about a payment it *did*
+    make, which is a lie about money in exchange for memory nobody is short of.
+    """
+    template = PLANE
+    key = (ctx.customer_id, ctx.session_id)
+    with _SCOPES_LOCK:
+        scopes = _SCOPES.setdefault(template, {})
+        plane = scopes.get(key)
+        if plane is None:
+            plane = ControlPlane(
+                template.bank.fresh(),
+                clock=template.clock,
+                store=template.store,
+                secret=template.secret,
+            )
+            scopes[key] = plane
+        return plane
+
 
 #: Only for a caller with no channel at all — an in-process drive of a tool
 #: (a unit test, a REPL). Every HTTP request carries a verified customer in
@@ -89,7 +157,8 @@ def get_balance(runtime: ToolRuntime) -> str:
     Returns:
         JSON com ``data.display`` (saldo formatado em reais).
     """
-    return _render(PLANE.query(context_for(runtime), GetBalance()))
+    ctx = context_for(runtime)
+    return _render(plane_for(ctx).query(ctx, GetBalance()))
 
 
 def get_card_transactions(runtime: ToolRuntime, days: int = 7) -> str:
@@ -101,7 +170,8 @@ def get_card_transactions(runtime: ToolRuntime, days: int = 7) -> str:
     Returns:
         JSON com ``data.transactions``: data, estabelecimento, valor, categoria.
     """
-    return _render(PLANE.query(context_for(runtime), GetCardTransactions(days=days)))
+    ctx = context_for(runtime)
+    return _render(plane_for(ctx).query(ctx, GetCardTransactions(days=days)))
 
 
 def propose_pix(runtime: ToolRuntime, recipient: str, amount: str) -> str:
@@ -131,10 +201,9 @@ def propose_pix(runtime: ToolRuntime, recipient: str, amount: str) -> str:
         return _render(
             Outcome(status="REQUIRE_MORE_INFO", message=str(exc).splitlines()[0])
         )
+    ctx = context_for(runtime)
     return _render(
-        PLANE.propose(
-            context_for(runtime), proposed, request_text=f"{recipient} {amount}"
-        )
+        plane_for(ctx).propose(ctx, proposed, request_text=f"{recipient} {amount}")
     )
 
 
@@ -151,7 +220,8 @@ def confirm_pix(runtime: ToolRuntime, confirmation_id: str) -> str:
         JSON com ``status``: ``COMPLETED``, ``FAILED``, ``UNKNOWN`` (sem
         resposta do banco — use ``check_pix``) ou ``DENY``.
     """
-    return _render(PLANE.confirm(context_for(runtime), confirmation_id))
+    ctx = context_for(runtime)
+    return _render(plane_for(ctx).confirm(ctx, confirmation_id))
 
 
 def cancel_pix(runtime: ToolRuntime, confirmation_id: str) -> str:
@@ -160,7 +230,8 @@ def cancel_pix(runtime: ToolRuntime, confirmation_id: str) -> str:
     Args:
         confirmation_id: O ``confirmation_id`` devolvido por ``propose_pix``.
     """
-    return _render(PLANE.cancel(context_for(runtime), confirmation_id))
+    ctx = context_for(runtime)
+    return _render(plane_for(ctx).cancel(ctx, confirmation_id))
 
 
 def check_pix(runtime: ToolRuntime, intent_id: str) -> str:
@@ -169,7 +240,8 @@ def check_pix(runtime: ToolRuntime, intent_id: str) -> str:
     Args:
         intent_id: O ``intent_id`` do PIX.
     """
-    return _render(PLANE.reconcile(context_for(runtime), intent_id))
+    ctx = context_for(runtime)
+    return _render(plane_for(ctx).reconcile(ctx, intent_id))
 
 
 def explain_action(runtime: ToolRuntime, intent_id: str) -> str:
@@ -180,9 +252,9 @@ def explain_action(runtime: ToolRuntime, intent_id: str) -> str:
     Args:
         intent_id: O ``intent_id`` de um PIX ou o id de uma consulta.
     """
+    ctx = context_for(runtime)
     events: list[dict[str, Any]] = [
-        e.model_dump(mode="json")
-        for e in PLANE.explain(context_for(runtime), intent_id)
+        e.model_dump(mode="json") for e in plane_for(ctx).explain(ctx, intent_id)
     ]
     if not events:
         return json.dumps(

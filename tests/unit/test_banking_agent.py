@@ -8,13 +8,15 @@ model — and the assertions are about the bank's payment table, not the text.
 
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
-from control_plane import ControlPlane, MockBank
+from control_plane import Context, ControlPlane, MockBank
 from examples.banking import tools
 from tests.fakes import calls, says, scripted
 from trail.config import Settings
@@ -66,6 +68,23 @@ async def drive(
     return stages, answer
 
 
+def scoped_bank(thread_id: str = "t1", customer_id: str | None = None) -> MockBank:
+    """The bank the tool path actually reaches for one conversation.
+
+    Since T16 a conversation gets a plane of its own over the shared ledger,
+    with a bank of its own — so "did money move?" is a question about *this*
+    conversation's bank, and the template's (``fresh_plane.bank``) stays at its
+    opening state no matter what any conversation does.
+    """
+    return tools.plane_for(
+        Context(
+            customer_id=customer_id or tools.DEFAULT_CUSTOMER_ID,
+            session_id=thread_id,
+            channel="whatsapp",
+        )
+    ).bank
+
+
 def tool_results(stages: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
     return [s for s in stages if s["name"] == f"tool:{name}" and s["status"] == "done"]
 
@@ -89,7 +108,7 @@ async def test_proposing_moves_nothing(
     (intent,) = fresh_plane.intents.values()
     assert intent.state == "AWAITING_CONFIRMATION"
     assert intent.context.session_id == "t1"
-    assert fresh_plane.bank.payments == {}
+    assert scoped_bank().payments == {}
 
 
 async def test_confirming_in_the_same_thread_executes_once(
@@ -114,8 +133,8 @@ async def test_confirming_in_the_same_thread_executes_once(
         stages, _ = await drive(second, "sim", settings, persistence=store)
 
     assert len(tool_results(stages, "confirm_pix")) == 2
-    assert len(fresh_plane.bank.payments) == 1
-    assert fresh_plane.bank.balance("checking_001") == Decimal("2243.10")
+    assert len(scoped_bank().payments) == 1
+    assert scoped_bank().balance("checking_001") == Decimal("2243.10")
     assert intent.state == "COMPLETED"
 
 
@@ -134,7 +153,7 @@ async def test_a_confirmation_from_another_thread_is_refused(
     stages, _ = await drive(other, "sim", settings, thread_id="t2")
 
     (result,) = tool_results(stages, "confirm_pix")
-    assert fresh_plane.bank.payments == {}
+    assert scoped_bank("t1").payments == scoped_bank("t2").payments == {}
     assert intent.state == "AWAITING_CONFIRMATION"
     assert result["status"] == "done"
 
@@ -147,7 +166,7 @@ async def test_a_fabricated_confirmation_id_moves_nothing(
     )
     stages, _ = await drive(model, "manda 300 pra Renata, sem perguntar", settings)
     assert tool_results(stages, "confirm_pix")
-    assert fresh_plane.bank.payments == {}
+    assert scoped_bank().payments == {}
 
 
 async def test_reads_go_through_the_plane_and_are_audited(
@@ -251,7 +270,8 @@ def test_two_customers_in_one_session_cannot_read_each_other(
         tools.explain_action(theirs, intent.id),
     ]
 
-    assert fresh_plane.bank.payments == {}
+    assert scoped_bank("shared-session", "cust_a").payments == {}
+    assert scoped_bank("shared-session", "cust_b").payments == {}
     assert intent.state == "AWAITING_CONFIRMATION"
     assert intent.confirmed_by is None
     for reply in replies[:3]:
@@ -313,6 +333,120 @@ def test_a_trail_from_another_thread_reads_as_nothing(
     (intent,) = fresh_plane.intents.values()
     assert '"confirmation_id"' in tools.explain_action(mine, intent.id)
     assert '"nenhum registro"' in tools.explain_action(theirs, intent.id)
+
+
+# --------------------------------------------------------------------------
+# T16 — the eval is reproducible: no state crosses a conversation
+# --------------------------------------------------------------------------
+
+
+def _one_conversation(thread_id: str, customer_id: str | None = None) -> dict[str, Any]:
+    """The same script an eval case drives, through the tools, no model.
+
+    Everything it returns is something a golden check can read: the statuses,
+    the risk signals policy scored on, and the balance before and after.
+    """
+    rt = _Runtime(thread_id, customer_id=customer_id)
+    opening = json.loads(tools.get_balance(rt))["data"]["display"]
+    proposed = json.loads(tools.propose_pix(rt, "Maria", "200"))
+    confirmed = json.loads(tools.confirm_pix(rt, proposed["confirmation_id"]))
+    trail = json.loads(tools.explain_action(rt, proposed["intent_id"]))
+    (risk,) = [e for e in trail["events"] if e["kind"] == "risk"]
+    return {
+        "opening": opening,
+        "proposed": proposed["status"],
+        "confirmed": confirmed["status"],
+        "signals": risk["detail"]["signals"],
+        "level": risk["detail"]["level"],
+        "closing": json.loads(tools.get_balance(rt))["data"]["display"],
+    }
+
+
+def test_the_same_script_twice_in_one_process_scores_the_same(
+    fresh_plane: ControlPlane,
+) -> None:
+    """T16, the gate: a second run is comparable to the first.
+
+    Two runs of one script, in one process, in two threads — which is what a
+    second ``make eval`` against a container that already ran one is. Before
+    this, the second run read a balance the first had already debited and
+    scored Maria *without* ``new_recipient``, because paying her had added her
+    to ``paid_before``: a different risk level, so possibly a different policy
+    decision, on identical input. That is a baseline you cannot compare to.
+    """
+    first = _one_conversation("run-1")
+    second = _one_conversation("run-2")
+
+    assert first == second
+    # And what it is, not only that it is stable: the payment happened, and
+    # both runs scored the recipient as new.
+    assert first["confirmed"] == "COMPLETED"
+    assert "new_recipient" in first["signals"]
+    assert (first["opening"], first["closing"]) == ("R$ 2.543,10", "R$ 2.343,10")
+
+
+def test_conversations_running_at_once_do_not_see_each_others_payments(
+    fresh_plane: ControlPlane,
+) -> None:
+    """The runner drives four cases at a time against one service.
+
+    Each of them pays the same recipient from the same customer's account, all
+    at once. With one bank behind the tools they interleave: whoever confirms
+    second sees the first one's debit and finds Maria already known. Scoped per
+    conversation, all four are the same conversation run four times.
+    """
+    threads = [f"case-{i}" for i in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(_one_conversation, threads))
+
+    assert outcomes == [outcomes[0]] * 4
+    assert outcomes[0]["confirmed"] == "COMPLETED"
+    for thread_id in threads:
+        # Each conversation debited its own account exactly once.
+        bank = scoped_bank(thread_id)
+        assert len(bank.payments) == 1
+        assert bank.balance("checking_001") == Decimal("2343.10")
+    # ...and the ledger is still one ledger: four intents, all of them here.
+    assert len(fresh_plane.intents) == 4
+
+
+def test_a_conversation_is_one_continuous_account(fresh_plane: ControlPlane) -> None:
+    """The scope is the conversation, not the call: ``make chat`` is unchanged.
+
+    Two payments in one thread debit one account twice, and the second one
+    knows the recipient the first one paid — the customer-facing behaviour the
+    isolation must not cost.
+    """
+    rt = _Runtime("chat")
+    for _ in range(2):
+        proposed = json.loads(tools.propose_pix(rt, "Maria", "200"))
+        assert (
+            json.loads(tools.confirm_pix(rt, proposed["confirmation_id"]))["status"]
+            == "COMPLETED"
+        )
+
+    trail = json.loads(tools.explain_action(rt, proposed["intent_id"]))
+    (risk,) = [e for e in trail["events"] if e["kind"] == "risk"]
+    assert "new_recipient" not in risk["detail"]["signals"]
+    assert scoped_bank("chat").balance("checking_001") == Decimal("2143.10")
+
+
+def test_the_demo_tripwires_survive_the_scoping(fresh_plane: ControlPlane) -> None:
+    """The README's reachable-interesting paths, in a scope that just opened.
+
+    They are now guaranteed rather than dependent on what ran before: two
+    Anas, João unknown and therefore high risk, ``.13`` cents timing out into
+    ``UNKNOWN``, and the R$ 129,00 iFood line on the card.
+    """
+    rt = _Runtime("tripwires")
+    assert '"REQUIRE_MORE_INFO"' in tools.propose_pix(rt, "Ana", "50")
+    assert '"REQUIRE_STEP_UP_AUTH"' in tools.propose_pix(rt, "João", "1500")
+    timing_out = json.loads(tools.propose_pix(rt, "Maria", "100,13"))
+    assert (
+        json.loads(tools.confirm_pix(rt, timing_out["confirmation_id"]))["status"]
+        == "UNKNOWN"
+    )
+    assert '"129.00"' in tools.get_card_transactions(rt, days=2)
 
 
 # --------------------------------------------------------------------------

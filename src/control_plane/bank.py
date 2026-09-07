@@ -16,7 +16,7 @@ reconciles finds the receipt. Both behaviours are tested.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
@@ -75,6 +75,37 @@ class MockBank:
     paid_before: set[str] = field(default_factory=lambda: {"contact_renata"})
     #: ``idempotency_key → receipt``. The ledger of what actually moved.
     payments: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    #: The opening position, captured before anything moves. Not an init field:
+    #: a caller configures the bank, it does not get to lie about where the
+    #: bank started.
+    _opening_accounts: dict[str, Decimal] = field(init=False, repr=False)
+    _opening_paid_before: set[str] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._opening_accounts = dict(self.accounts)
+        self._opening_paid_before = set(self.paid_before)
+
+    def fresh(self) -> MockBank:
+        """Another bank with this one's configuration and none of its movement.
+
+        Two of these fields are policy inputs, not bookkeeping: the balance
+        feeds the sufficient-funds precondition, and ``paid_before`` feeds the
+        ``new_recipient`` risk signal, which moves risk between levels and can
+        therefore move the decision. Sharing them across conversations is what
+        made a second `make eval` in the same container score differently from
+        the first — a measurement problem, not a security one, and the one that
+        invalidates every baseline comparison.
+
+        ``replace`` rather than a bare constructor so a subclass keeps its own
+        configuration (``FaultyBank`` keeps ``crash_at``).
+        """
+        return replace(
+            self,
+            accounts=dict(self._opening_accounts),
+            paid_before=set(self._opening_paid_before),
+            payments={},
+        )
 
     # --- reads --------------------------------------------------------------
 
