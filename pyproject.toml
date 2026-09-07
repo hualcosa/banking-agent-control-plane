@@ -68,8 +68,12 @@ dev = [
 ]
 
 [project.scripts]
-# The CLI speaks HTTP to the agent, exactly as the eval harness does — never
-# to the agent's internals.
+# `chat` and `eval` speak HTTP to the agent, exactly as any client would.
+# `step-up`, `intents` and `reconcile` deliberately do not: they open the
+# shared Postgres and build their own control plane, because an out-of-band
+# channel that goes through the agent's own API is not out of band, and an
+# operator resolving an UNKNOWN intent usually needs to work while the agent
+# is the thing that is down.
 trail = "trail.cli:main"
 
 [tool.hatch.build.targets.wheel]
