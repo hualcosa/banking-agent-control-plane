@@ -295,7 +295,8 @@ def test_the_digest_does_not_depend_on_field_order() -> None:
 def test_the_banking_spec_sweeps_on_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """A sweep nobody calls is a method, not a recovery. The runtime knows
     only `spec.on_startup`; what it does belongs to the example."""
-    from examples.banking import agent as banking, tools
+    from examples.banking import agent as banking
+    from examples.banking import tools
 
     store, clock = MemoryStore(), Clock()
     bank = FaultyBank(crash_at="after_pay")
