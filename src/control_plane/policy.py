@@ -17,8 +17,10 @@ Every verdict names its rule. "Denied" is not an answer; "denied by
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from control_plane.actions import (
     ASSURANCE_RANK,
@@ -27,6 +29,7 @@ from control_plane.actions import (
     RiskLevel,
     capability,
 )
+from control_plane.state import now as system_now
 
 Decision = Literal[
     "ALLOW",
@@ -38,11 +41,30 @@ Decision = Literal[
 ]
 
 #: Above this a PIX needs strong assurance — a step-up — before confirmation.
+#: Institution's choice.
 STEP_UP_ABOVE = Decimal("1000")
-#: Above this a PIX from an assistant is refused outright. A ceiling on what
+#: Above this a PIX from an assistant is refused outright. **This is the
+#: per-transaction ceiling for this channel, and it is the institution's
+#: number, not the regulator's.** BACEN fixes no per-PIX ceiling: Resolução
+#: BCB nº 142/2021 lets each institution set its own limits per channel, and
+#: only the nighttime cap below is written into the norm. A ceiling on what
 #: the autonomous path may ever move; raising it is a policy change, not a
 #: config change, and lives here for that reason.
 HARD_LIMIT = Decimal("5000")
+#: **Regulator-fixed.** Resolução BCB nº 142/2021 caps PIX to a natural
+#: person at R$ 1.000 during the nighttime window. The institution may set a
+#: *lower* cap, never a higher one without the customer asking for it.
+NIGHT_LIMIT = Decimal("1000")
+#: **Regulator-fixed.** The window runs 20h–06h *local Brazilian time* —
+#: [NIGHT_START_HOUR, 24) ∪ [0, NIGHT_END_HOUR) — so a UTC instant is
+#: converted to :data:`BR_TZ` before its hour is read. Comparing a UTC hour
+#: to a Brazilian clock silently moves the window by three hours.
+NIGHT_START_HOUR = 20
+NIGHT_END_HOUR = 6
+#: The timezone the norm is written in. Brazil has had no DST since 2019, but
+#: naming the zone (rather than a fixed -03:00) keeps that a fact about the
+#: tz database and not an assumption baked into this module.
+BR_TZ = ZoneInfo("America/Sao_Paulo")
 #: An amount the risk engine calls unusual for this customer. Mocked: a real
 #: engine derives it from the customer's history.
 UNUSUAL_ABOVE = Decimal("500")
@@ -84,15 +106,42 @@ class Verdict:
     reason: str
 
 
-def evaluate(action: CreatePix, ctx: Context, risk: Risk) -> Verdict:
-    """The rule set. Ordered; the first rule that applies decides."""
+def is_nighttime(moment: datetime) -> bool:
+    """Is ``moment`` inside the BACEN nighttime window, on a Brazilian clock?"""
+    hour = moment.astimezone(BR_TZ).hour
+    return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
+
+
+def evaluate(
+    action: CreatePix, ctx: Context, risk: Risk, *, now: datetime | None = None
+) -> Verdict:
+    """The rule set. Ordered; the first rule that applies decides.
+
+    ``now`` is the clock, injected. ``None`` means "ask the system" — that
+    default is what lets every caller stay unchanged while a test pins the
+    hour to either side of a boundary.
+    """
     cap = capability(action)
+    moment = system_now() if now is None else now
 
     if action.amount > HARD_LIMIT:
         return Verdict(
             "DENY",
             "pix_hard_limit",
             f"PIX acima do limite do assistente (R$ {HARD_LIMIT:.2f})",
+        )
+
+    # Before the step-up rule on purpose: a denial that is only reachable
+    # after the customer has already authenticated is not a denial, it is a
+    # trap. V0 treats every recipient as a natural person — the pessimistic
+    # reading, and the only one the mocked contact book supports.
+    if action.amount > NIGHT_LIMIT and is_nighttime(moment):
+        return Verdict(
+            "DENY",
+            "pix_nighttime_limit",
+            f"PIX acima de R$ {NIGHT_LIMIT:.2f} entre "
+            f"{NIGHT_START_HOUR}h e {NIGHT_END_HOUR:02d}h "
+            "não é permitido (Resolução BCB nº 142/2021)",
         )
 
     needs_strong = action.amount > STEP_UP_ABOVE or risk.level == "high"

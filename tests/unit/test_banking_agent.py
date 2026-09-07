@@ -8,6 +8,7 @@ model — and the assertions are about the bank's payment table, not the text.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -25,9 +26,14 @@ from trail.runtime.turns import STAGE, TURN, run_turn
 pytestmark = pytest.mark.unit
 
 
+#: See ``tests/unit/test_control_plane.py``: the nighttime rule reads the
+#: hour, so the plane under test gets a fixed one.
+MIDDAY = datetime(2026, 9, 6, 15, 0, tzinfo=timezone.utc)
+
+
 @pytest.fixture(autouse=True)
 def fresh_plane(monkeypatch: pytest.MonkeyPatch) -> ControlPlane:
-    plane = ControlPlane(MockBank())
+    plane = ControlPlane(MockBank(), clock=lambda: MIDDAY)
     monkeypatch.setattr(tools, "PLANE", plane)
     return plane
 

@@ -24,6 +24,8 @@ same session — a "yes" cannot be borrowed across conversations.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -77,8 +79,22 @@ class Outcome(BaseModel):
 
 
 class ControlPlane:
-    def __init__(self, bank: MockBank | None = None) -> None:
+    """The boundary. One instance owns a bank, a ledger and the live intents.
+
+    ``clock`` is the plane's source of "now", injected so that a rule which
+    reads the hour — the BACEN nighttime cap — is testable at a fixed instant
+    rather than only between 06h and 20h. The default is the system clock, so
+    nothing but a test passes anything here.
+    """
+
+    def __init__(
+        self,
+        bank: MockBank | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.bank = bank if bank is not None else MockBank()
+        self.clock = clock if clock is not None else now
         self.ledger = Ledger()
         self.intents: dict[str, Intent] = {}
 
@@ -315,7 +331,7 @@ class ControlPlane:
             level=risk.level,
             signals=list(risk.signals),
         )
-        verdict = evaluate(intent.action, intent.context, risk)
+        verdict = evaluate(intent.action, intent.context, risk, now=self.clock())
         self.ledger.append(
             intent.id,
             "policy",

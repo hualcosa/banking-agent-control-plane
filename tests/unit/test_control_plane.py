@@ -7,6 +7,7 @@ repository exists to build has a hole in it.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -33,9 +34,15 @@ OTHER_SESSION = Context(customer_id="cust_123", session_id="thread-2")
 OTHER_CUSTOMER = Context(customer_id="cust_999", session_id="thread-1")
 
 
+#: Midday in São Paulo. Pinned because the BACEN nighttime rule reads the
+#: hour: with the system clock these tests pass for fourteen hours a day and
+#: fail for the other ten, which is not a test, it is a coin toss.
+MIDDAY = datetime(2026, 9, 6, 15, 0, tzinfo=timezone.utc)
+
+
 @pytest.fixture
 def plane() -> ControlPlane:
-    return ControlPlane(MockBank())
+    return ControlPlane(MockBank(), clock=lambda: MIDDAY)
 
 
 def pix(recipient: str, amount: str) -> ProposedPix:
@@ -206,6 +213,21 @@ def test_explain_reconstructs_the_whole_pipeline(plane: ControlPlane) -> None:
         < trail.index("confirmation")
         < trail.index("execution_request")
     )
+
+
+def test_the_planes_clock_reaches_the_nighttime_rule(plane: ControlPlane) -> None:
+    """The seam, end to end: the hour the plane is told decides the verdict."""
+    night = ControlPlane(
+        MockBank(), clock=lambda: datetime(2026, 9, 6, 23, 30, tzinfo=timezone.utc)
+    )  # 20:30 in São Paulo
+    out = night.propose(CTX, pix("Renata", "1500"))
+    assert out.status == "DENY"
+    rule = next(e for e in night.explain(CTX, out.intent_id) if e.kind == "policy")
+    assert rule.detail["rule"] == "pix_nighttime_limit"
+    assert night.bank.payments == {}
+
+    # The same proposal at midday is a step-up demand, not a refusal.
+    assert plane.propose(CTX, pix("Renata", "1500")).status == "REQUIRE_STEP_UP_AUTH"
 
 
 def test_a_trail_is_only_readable_by_the_principal_that_opened_it(
