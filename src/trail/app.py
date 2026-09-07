@@ -46,7 +46,9 @@ from trail.runtime.threads import (
     forget,
     list_threads,
     open_thread,
+    owner_of,
     record_turn,
+    visible_to,
 )
 from trail.runtime.turns import ERROR, TURN, run_turn
 from trail.telemetry import configure_logging, setup_telemetry
@@ -239,6 +241,35 @@ def customer_id(request: Request) -> str:
     return resolved
 
 
+#: One message for a thread this customer cannot have. A thread that belongs to
+#: someone else and a thread that never existed answer with the same 404 and
+#: the same string: 403 would confirm the id is real, which is the only thing
+#: an attacker holding a guessed thread id is missing. The control plane makes
+#: the same choice for a ledger trail — see ``ControlPlane.explain``.
+_NO_SUCH_THREAD = "conversa não encontrada"
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_THREAD)
+
+
+async def _refuse_someone_elses_thread(store, thread_id: str, customer: str) -> None:
+    """Refuse a turn on a thread that already belongs to somebody else.
+
+    Weaker than :func:`~trail.runtime.threads.visible_to`, and deliberately: a
+    turn on an id the index has never seen is how a thread is resumed after a
+    restart and how a client that skipped ``POST /threads`` starts one, so an
+    unknown id is *claimed* rather than refused. What cannot happen is a turn
+    on a thread someone else owns — that would run the agent over their
+    checkpoint and stream their conversation back as context.
+
+    The answer is the same 404 as reading it, for the same reason.
+    """
+    owner = await owner_of(store, thread_id)
+    if owner is not None and owner != customer:
+        raise _not_found()
+
+
 def _store(request: Request):
     """The cross-thread store, or ``None`` when the runtime has no persistence."""
     persistence = getattr(request.app.state, "persistence", None)
@@ -274,13 +305,10 @@ def _readable_messages(messages: list) -> list[Message]:
     "/threads",
     response_model=StartThreadResponse,
     status_code=status.HTTP_201_CREATED,
-    # Authentication only: this endpoint does nothing per-customer, but an
-    # endpoint that answers an unauthenticated caller is a way in, and the
-    # cheapest way to have no unauthenticated way in is for every route that
-    # is not ``/healthz`` to require the same header.
-    dependencies=[Depends(customer_id)],
 )
-async def start_thread(request: Request) -> StartThreadResponse:
+async def start_thread(
+    request: Request, customer: str = Depends(customer_id)
+) -> StartThreadResponse:
     """Open a thread.
 
     No model call happens here. The greeting is the example's own string, and
@@ -293,7 +321,9 @@ async def start_thread(request: Request) -> StartThreadResponse:
     # Indexed on creation, not on first use. A thread that was opened and never
     # answered is worth seeing as exactly that — indexing only what succeeded
     # would hide the case where every turn is failing.
-    await open_thread(_store(request), thread_id)
+    # The customer is written with the record: this is where the thread gets an
+    # owner, and every other endpoint reads it back to decide what it may say.
+    await open_thread(_store(request), thread_id, customer)
     return StartThreadResponse(
         thread_id=thread_id,
         agent=spec.name,
@@ -320,6 +350,7 @@ async def stream_turn(
     agent = request.app.state.agent
 
     store = _store(request)
+    await _refuse_someone_elses_thread(store, thread_id, customer)
 
     async def frames() -> AsyncIterator[str]:
         async for name, payload in run_turn(
@@ -333,7 +364,7 @@ async def stream_turn(
         # After the frames, so a client is never waiting on a write it cannot
         # see. A failed turn is still recorded: the sidebar should show the
         # conversation you were having when it broke.
-        await record_turn(store, thread_id, body.message)
+        await record_turn(store, thread_id, body.message, customer)
 
     return StreamingResponse(
         frames(), media_type="text/event-stream", headers=SSE_HEADERS
@@ -355,7 +386,9 @@ async def submit_turn(
     """
     settings = _settings(request)
     agent = request.app.state.agent
-    await record_turn(_store(request), thread_id, body.message)
+    store = _store(request)
+    await _refuse_someone_elses_thread(store, thread_id, customer)
+    await record_turn(store, thread_id, body.message, customer)
     answer: dict | None = None
 
     async for name, payload in run_turn(
@@ -386,18 +419,23 @@ async def submit_turn(
     return answer
 
 
-@app.get(
-    "/threads",
-    response_model=ThreadListResponse,
-    dependencies=[Depends(customer_id)],
-)
+@app.get("/threads", response_model=ThreadListResponse)
 async def get_threads(
-    request: Request, limit: int = 50, offset: int = 0
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    customer: str = Depends(customer_id),
 ) -> ThreadListResponse:
-    """The conversation list, most recently used first."""
+    """This customer's conversations, most recently used first.
+
+    Scoped, not merely authenticated. The list is the cheapest disclosure in
+    the service — one request and you have every conversation id in the
+    deployment — so the customer resolved from the header is a filter here and
+    not just a gate.
+    """
     persistence = getattr(request.app.state, "persistence", None)
     summaries: list[ThreadSummary] = await list_threads(
-        _store(request), limit=limit, offset=offset
+        _store(request), customer_id=customer, limit=limit, offset=offset
     )
     return ThreadListResponse(
         threads=[summary.as_json() for summary in summaries],
@@ -405,38 +443,51 @@ async def get_threads(
     )
 
 
-@app.get(
-    "/threads/{thread_id}",
-    response_model=ThreadResponse,
-    dependencies=[Depends(customer_id)],
-)
-async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
-    """Reopen a conversation.
+@app.get("/threads/{thread_id}", response_model=ThreadResponse)
+async def get_thread(
+    thread_id: str, request: Request, customer: str = Depends(customer_id)
+) -> ThreadResponse:
+    """Reopen one of this customer's conversations.
 
-    Read from the checkpointer rather than from the index: the index knows a
-    thread exists, the checkpointer knows what was said. A thread with no
-    checkpoint answers with an empty transcript rather than a 404, because it
-    is a real thread — it is one nobody has spoken to yet.
+    Two stores answer two different questions, and both are asked. The index
+    says whether this thread is *this customer's*; the checkpointer says what
+    was said in it. A thread the index does not have for this customer — theirs
+    and never opened, or somebody else's — is a 404 with the same body either
+    way, so the endpoint cannot be walked to find out which thread ids exist.
+
+    A thread that is this customer's but has no checkpoint still answers 200
+    with an empty transcript. It is a real thread; it is one nobody has spoken
+    to yet, and that is not the same answer as "no such thread".
     """
+    if not await visible_to(_store(request), thread_id, customer):
+        raise _not_found()
     agent = request.app.state.agent
     state = await agent.aget_state({"configurable": {"thread_id": thread_id}})
     messages = (state.values or {}).get("messages", []) if state else []
     return ThreadResponse(thread_id=thread_id, messages=_readable_messages(messages))
 
 
-@app.delete(
-    "/threads/{thread_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(customer_id)],
-)
-async def delete_thread(thread_id: str, request: Request) -> None:
-    """Drop a conversation from the list.
+@app.delete("/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_thread(
+    thread_id: str, request: Request, customer: str = Depends(customer_id)
+) -> None:
+    """Drop one of this customer's conversations from the list.
+
+    Someone else's thread is a 404 and so is an id that never existed — the
+    same pair of answers ``GET`` gives, because a delete that answered 204 for
+    a thread it did not touch would be a lie, and one that answered 403 would
+    confirm the id. The cost is that deleting twice is a 404 the second time;
+    an idempotent 204 here would be an existence oracle, and that is the more
+    expensive of the two.
 
     The checkpoint stays. "Delete" here means what it means to someone tidying
     a sidebar, and this endpoint does not reach into storage it does not own to
     do something irreversible.
     """
-    await forget(_store(request), thread_id)
+    store = _store(request)
+    if not await visible_to(store, thread_id, customer):
+        raise _not_found()
+    await forget(store, thread_id)
 
 
 @app.get("/healthz")

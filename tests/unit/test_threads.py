@@ -15,8 +15,10 @@ from trail.runtime.threads import (
     forget,
     list_threads,
     open_thread,
+    owner_of,
     record_turn,
     title_from,
+    visible_to,
 )
 
 pytestmark = pytest.mark.unit
@@ -185,6 +187,109 @@ async def test_every_summary_serialises(store: InMemoryStore) -> None:
 
 
 # --------------------------------------------------------------------------
+# ownership
+# --------------------------------------------------------------------------
+
+
+async def test_a_thread_belongs_to_whoever_opened_it(store: InMemoryStore) -> None:
+    await open_thread(store, "t1", "cust_a")
+    assert await owner_of(store, "t1") == "cust_a"
+    assert await visible_to(store, "t1", "cust_a") is True
+    assert await visible_to(store, "t1", "cust_b") is False
+
+
+async def test_a_first_turn_claims_an_unowned_thread(store: InMemoryStore) -> None:
+    """The client that skipped ``POST /threads`` still ends up with an owner.
+
+    Without this, a thread created by a turn alone would be nobody's, and a
+    thread that is nobody's is one that answers 404 to the person having the
+    conversation.
+    """
+    await record_turn(store, "t1", "oi", "cust_a")
+    assert await owner_of(store, "t1") == "cust_a"
+
+
+async def test_a_turn_from_another_customer_does_not_relabel_a_thread(
+    store: InMemoryStore,
+) -> None:
+    """Ownership is set once, like the title.
+
+    The endpoints refuse this request before it reaches here; the store refuses
+    it too, so the rule does not depend on the caller remembering it. Nothing
+    is written at all — not the turn, not the title, not the owner.
+    """
+    await record_turn(store, "t1", "primeira", "cust_a")
+    await record_turn(store, "t1", "invasão", "cust_b")
+
+    assert await owner_of(store, "t1") == "cust_a"
+    mine = await list_threads(store, customer_id="cust_a")
+    assert [(t.thread_id, t.turns, t.title) for t in mine] == [("t1", 1, "primeira")]
+    assert await list_threads(store, customer_id="cust_b") == []
+
+
+async def test_an_unknown_thread_is_as_invisible_as_someone_elses(
+    store: InMemoryStore,
+) -> None:
+    """Both are ``False``, so the endpoint above can answer both with one 404."""
+    await open_thread(store, "t1", "cust_a")
+    assert await visible_to(store, "t-nao-existe", "cust_a") is False
+    assert await visible_to(store, "t1", "cust_b") is False
+    assert await owner_of(store, "t-nao-existe") is None
+
+
+async def test_a_listing_is_scoped_and_paged_within_one_customer(
+    store: InMemoryStore,
+) -> None:
+    """B's page is B's threads, and the offset does not walk into A's.
+
+    Paging is where a scope is easiest to lose: filter after cutting the page
+    and an offset past B's own threads starts returning A's.
+    """
+    for index in range(3):
+        await record_turn(store, f"a-{index}", "de A", "cust_a")
+    await record_turn(store, "b-0", "de B", "cust_b")
+
+    assert [t.thread_id for t in await list_threads(store, customer_id="cust_b")] == [
+        "b-0"
+    ]
+    assert await list_threads(store, customer_id="cust_b", offset=1) == []
+    assert len(await list_threads(store, customer_id="cust_a")) == 3
+
+
+async def test_an_unowned_record_belongs_to_nobody_rather_than_everybody(
+    store: InMemoryStore,
+) -> None:
+    """Fail closed on a record written before threads had owners.
+
+    An in-process caller records no owner. Such a record is not a wildcard: it
+    is nobody's, so it appears in no customer's list and is visible to no
+    customer. The unscoped caller — no channel, no HTTP surface — still sees it.
+    """
+    await record_turn(store, "legacy", "oi")
+
+    assert await owner_of(store, "legacy") is None
+    assert await visible_to(store, "legacy", "cust_a") is False
+    assert await list_threads(store, customer_id="cust_a") == []
+    assert [t.thread_id for t in await list_threads(store)] == ["legacy"]
+
+
+async def test_the_unscoped_caller_still_sees_the_whole_index(
+    store: InMemoryStore,
+) -> None:
+    """The in-process path keeps working exactly as it did.
+
+    Unit callers and direct drives pass no customer and have no channel to
+    resolve one from; scoping by a customer that does not exist would make the
+    index unusable there.
+    """
+    await record_turn(store, "a", "de A", "cust_a")
+    await record_turn(store, "b", "de B", "cust_b")
+
+    assert {t.thread_id for t in await list_threads(store)} == {"a", "b"}
+    assert await visible_to(store, "a", None) is True
+
+
+# --------------------------------------------------------------------------
 # the no-store case
 # --------------------------------------------------------------------------
 
@@ -196,7 +301,12 @@ async def test_every_operation_is_a_no_op_without_a_store() -> None:
     thread index that raised there would make the index a hard dependency of a
     runtime that deliberately does not have one.
     """
-    await open_thread(None, "t1")
-    await record_turn(None, "t1", "oi")
+    await open_thread(None, "t1", "cust_a")
+    await record_turn(None, "t1", "oi", "cust_a")
     await forget(None, "t1")
-    assert await list_threads(None) == []
+    assert await list_threads(None, customer_id="cust_a") == []
+    # No index means no ownership to check, not "everything is forbidden": a
+    # runtime built without persistence must still serve the thread it is
+    # holding in memory.
+    assert await owner_of(None, "t1") is None
+    assert await visible_to(None, "t1", "cust_a") is True

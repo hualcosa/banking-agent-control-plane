@@ -16,6 +16,14 @@ is exactly why this repository declares none of it — and a query written
 against someone else's versioned schema breaks on their next release, silently,
 in production.
 
+The index is also where a thread's **owner** lives. A conversation belongs to
+the customer whose turn created it, every endpoint answers only about that
+customer's threads, and a thread belonging to someone else is indistinguishable
+from one that never existed — the rule ``ControlPlane.explain`` already follows
+for a ledger trail. It is recorded in the record this module writes rather than
+beside LangGraph's ``checkpoints`` for the reason above: that row is the
+library's, this one is ours.
+
 The index follows the same dial as everything else: with
 ``TRAIL_CHECKPOINTER=memory`` it lives in memory and dies with the process,
 alongside the conversations it indexes. That is not a defect to hide — it is
@@ -30,9 +38,28 @@ from datetime import datetime, timezone
 from typing import Any
 
 #: Where thread records live in the store. A tuple, because store namespaces
-#: are hierarchical and a future index (per user, per agent) nests under this
-#: rather than colliding with it.
+#: are hierarchical and a future index (per agent) nests under this rather than
+#: colliding with it.
 NAMESPACE = ("threads",)
+
+#: The field naming the customer a thread belongs to, inside the record.
+#:
+#: Ownership is recorded *here*, in TRAIL's own index row, and not in a
+#: namespace of its own (``("threads", customer_id)``) and not in a table beside
+#: LangGraph's ``checkpoints``. Both alternatives were considered and both are
+#: worse:
+#:
+#: * A per-customer **namespace** scopes the listing for free, but it makes the
+#:   one question every other endpoint asks — *who owns this thread id?* — a
+#:   scan across namespaces instead of a single ``aget``. Ownership has to be
+#:   answerable from the id alone, because that is all a request carries.
+#: * A **table** would mean declaring conversation state in ``db/schema.sql``,
+#:   which is the duplication that file's header refuses; the checkpointer owns
+#:   the row keyed by ``thread_id`` and this index is the part TRAIL owns.
+#:
+#: So it is one more key in a record this module already writes, reads and
+#: deletes as a unit — no second store, no second lifetime, nothing to migrate.
+OWNER = "customer_id"
 
 #: How much of the first question becomes the title. Long enough to tell two
 #: conversations apart in a narrow sidebar, short enough not to wrap twice.
@@ -80,12 +107,19 @@ class ThreadSummary:
         }
 
 
-async def open_thread(store: Any, thread_id: str) -> None:
+async def open_thread(
+    store: Any, thread_id: str, customer_id: str | None = None
+) -> None:
     """Record a thread that has been created but not yet spoken to.
 
     Written on creation so the record carries a real ``created_at``, and so an
     abandoned thread exists in the store to be counted. It does **not** reach
     the sidebar — see :func:`list_threads`.
+
+    ``customer_id`` is who it belongs to. ``None`` is the in-process caller
+    with no channel behind it (tests, direct drives), the same convention
+    :func:`~trail.runtime.turns.run_turn` uses: it records no owner rather than
+    inventing one.
     """
     if store is None:
         return
@@ -93,21 +127,38 @@ async def open_thread(store: Any, thread_id: str) -> None:
     await store.aput(
         NAMESPACE,
         thread_id,
-        {"title": "", "turns": 0, "created_at": now, "updated_at": now},
+        {
+            "title": "",
+            "turns": 0,
+            "created_at": now,
+            "updated_at": now,
+            OWNER: customer_id,
+        },
     )
 
 
-async def record_turn(store: Any, thread_id: str, message: str) -> None:
+async def record_turn(
+    store: Any, thread_id: str, message: str, customer_id: str | None = None
+) -> None:
     """Bump a thread's turn count, and title it from its first message.
 
     The title is set once and never rewritten: a conversation is remembered by
     how it opened, and a title that changes under the reader is a title they
     cannot use to find anything.
+
+    Ownership is set once too, and by the same rule: a thread belongs to the
+    customer whose turn created it. A turn from anyone else on a thread that
+    already has an owner writes **nothing** — the endpoints refuse that request
+    before it gets here, and a store function that would happily relabel
+    someone else's conversation is a second place for that rule to be wrong.
     """
     if store is None:
         return
     existing = await store.aget(NAMESPACE, thread_id)
     value: dict[str, Any] = dict(existing.value) if existing else {}
+    owner = value.get(OWNER)
+    if owner is not None and customer_id is not None and owner != customer_id:
+        return
     turns = int(value.get("turns", 0)) + 1
     await store.aput(
         NAMESPACE,
@@ -117,14 +168,26 @@ async def record_turn(store: Any, thread_id: str, message: str) -> None:
             "turns": turns,
             "created_at": value.get("created_at") or _now(),
             "updated_at": _now(),
+            OWNER: owner if owner is not None else customer_id,
         },
     )
 
 
 async def list_threads(
-    store: Any, *, limit: int = 50, offset: int = 0
+    store: Any, *, customer_id: str | None = None, limit: int = 50, offset: int = 0
 ) -> list[ThreadSummary]:
-    """Conversations, most recently used first. Threads with no turns are omitted.
+    """One customer's conversations, most recently used first. Threads with no
+    turns are omitted.
+
+    ``customer_id`` is the scope, and it is not a convenience: a list is a
+    disclosure. Another customer's threads must not appear, and must not be
+    countable either — the filter runs before the page is cut, so an offset
+    into someone else's conversations is an offset into nothing rather than a
+    gap that reveals how many there were.
+
+    ``None`` is the in-process caller with no channel, which sees the whole
+    index. That path has no identity to scope by and no HTTP surface to reach
+    it through; ``app.py`` always passes a resolved customer.
 
     Sorted here rather than by the store, because ``asearch`` orders by
     relevance for a semantic query and by nothing in particular without one.
@@ -158,7 +221,19 @@ async def list_threads(
     # than one demo produces, and the alternative is a loop that reads until it
     # has enough, which is real paging complexity bought for a case nobody has.
     # When someone does: index `turns` in the store and filter there.
-    items = await store.asearch(NAMESPACE, limit=SCAN_LIMIT)
+    #
+    # The scope goes to the store as a `filter` so the bounded window is spent
+    # on this customer's records rather than on everyone's — with one window
+    # for the whole index, a busy neighbour could push a quiet customer's
+    # threads past `SCAN_LIMIT` and out of their own sidebar. It is applied
+    # again below because this module cannot prove what every store backend
+    # does with a filter it does not index, and a scoping rule that a backend
+    # can silently decline to enforce is not a scoping rule.
+    items = await store.asearch(
+        NAMESPACE,
+        limit=SCAN_LIMIT,
+        **({} if customer_id is None else {"filter": {OWNER: customer_id}}),
+    )
     summaries = [
         ThreadSummary(
             thread_id=item.key,
@@ -169,13 +244,58 @@ async def list_threads(
         )
         for item in items
         if int(item.value.get("turns", 0)) > 0
+        and (customer_id is None or item.value.get(OWNER) == customer_id)
     ]
     summaries.sort(key=lambda summary: summary.updated_at, reverse=True)
     return summaries[offset : offset + limit]
 
 
+async def owner_of(store: Any, thread_id: str) -> str | None:
+    """The customer a thread belongs to, or ``None`` if the index names none.
+
+    ``None`` covers two cases on purpose — the index has no record of this id
+    at all, and it has one that predates ownership or was written by an
+    in-process caller. Neither names a customer, so neither can be used to
+    refuse one: this answers *who owns it*, and :func:`visible_to` is what
+    answers *may this caller see it*.
+    """
+    if store is None:
+        return None
+    record = await store.aget(NAMESPACE, thread_id)
+    if record is None:
+        return None
+    owner = record.value.get(OWNER)
+    return owner if isinstance(owner, str) else None
+
+
+async def visible_to(store: Any, thread_id: str, customer_id: str | None) -> bool:
+    """Whether ``customer_id`` may read this thread.
+
+    A thread that belongs to someone else and a thread that never existed are
+    both ``False``, which is the whole point: the caller turns both into the
+    same 404, so the endpoint cannot be used to test whether a thread id is
+    real. This is the rule ``ControlPlane.explain`` follows for a ledger trail,
+    said once more for a transcript.
+
+    Two cases answer ``True`` without an owner check, and both are the absence
+    of a question rather than a permissive answer to one: no store (a runtime
+    built with no persistence has no index to ask) and no ``customer_id`` (an
+    in-process caller with no channel, which is not reachable over HTTP —
+    ``app.py`` answers 401 long before it gets here).
+    """
+    if store is None or customer_id is None:
+        return True
+    record = await store.aget(NAMESPACE, thread_id)
+    return record is not None and record.value.get(OWNER) == customer_id
+
+
 async def forget(store: Any, thread_id: str) -> None:
     """Drop a thread from the index.
+
+    Unscoped on purpose: ownership is checked by the caller, which has to
+    distinguish "not yours" from "not there" *before* deciding what to answer,
+    and a delete that silently did nothing would leave that decision made in
+    two places. The endpoint calls :func:`visible_to` first.
 
     The conversation itself stays in the checkpointer. This removes it from the
     list, which is what "delete" means to someone tidying a sidebar — and it

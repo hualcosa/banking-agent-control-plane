@@ -370,22 +370,187 @@ def test_get_thread_on_an_unanswered_thread_is_an_empty_transcript_not_a_404(
 def test_deleting_a_thread_drops_it_from_the_list_but_keeps_the_transcript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = scripted(says("pronto"))
+    """Deleting is still off the sidebar, not out of the checkpointer.
+
+    What changed with ownership is where the transcript can be reached from.
+    The index is what says a thread is yours, so dropping the record drops the
+    only evidence that would let the service hand it back: a deleted thread is
+    a 404, indistinguishable from an id that never existed, which is the point.
+
+    The checkpoint is untouched, and speaking to the same id proves it — the
+    conversation resumes with its history rather than starting empty.
+    """
+    model = scripted(says("pronto"), says("de novo"))
     with running_app(monkeypatch, model) as client:
         thread = open_thread(client)
         client.post(f"/threads/{thread['thread_id']}/turns", json={"message": "oi"})
 
         delete_response = client.delete(f"/threads/{thread['thread_id']}")
         listed = client.get("/threads").json()["threads"]
+        gone = client.get(f"/threads/{thread['thread_id']}")
+
+        client.post(f"/threads/{thread['thread_id']}/turns", json={"message": "voltei"})
         reopened = client.get(f"/threads/{thread['thread_id']}").json()
 
     assert delete_response.status_code == 204
     assert listed == []
-    # "Delete" means off the sidebar, not out of the checkpointer.
+    assert gone.status_code == 404
     assert reopened["messages"] == [
         {"role": "user", "text": "oi"},
         {"role": "agent", "text": "pronto"},
+        {"role": "user", "text": "voltei"},
+        {"role": "agent", "text": "de novo"},
     ]
+
+
+# --------------------------------------------------------------------------
+# scoping: a thread belongs to the customer whose turn created it
+# --------------------------------------------------------------------------
+
+
+def test_a_customer_never_sees_another_customers_thread_in_the_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A list is a disclosure, and B's list must not count A's conversations.
+
+    Both customers speak in the same process against the same index, which is
+    what makes this a test of the endpoint rather than of two empty stores: A's
+    thread is genuinely there, and B's list is empty anyway.
+    """
+    model = scripted(says("para A"), says("para B"))
+    with running_app(monkeypatch, model) as client:
+        mine = open_thread(client)
+        client.post(f"/threads/{mine['thread_id']}/turns", json={"message": "oi"})
+
+        theirs = client.post("/threads", headers=header(OTHER_CUSTOMER)).json()
+        client.post(
+            f"/threads/{theirs['thread_id']}/turns",
+            json={"message": "olá"},
+            headers=header(OTHER_CUSTOMER),
+        )
+
+        mine_list = client.get("/threads").json()["threads"]
+        theirs_list = client.get("/threads", headers=header(OTHER_CUSTOMER)).json()
+
+    assert [t["thread_id"] for t in mine_list] == [mine["thread_id"]]
+    # Not "A's thread is absent" — B's list is exactly B's, and its length
+    # says nothing about how many conversations the deployment holds.
+    assert [t["thread_id"] for t in theirs_list["threads"]] == [theirs["thread_id"]]
+
+
+def test_a_borrowed_thread_id_and_an_invented_one_are_the_same_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heart of it: 404, not 403, and byte-identical to a nonexistent id.
+
+    A 403 answers the one question the attacker cannot otherwise answer — is
+    this thread id real? — so a thread that belongs to someone else must look
+    exactly like a thread that does not exist. Status *and* body are compared,
+    because a distinguishing detail string is the same oracle in a different
+    field. This is ``ControlPlane.explain``'s rule, applied to a transcript.
+    """
+    model = scripted(says("segredo do A"))
+    with running_app(monkeypatch, model) as client:
+        mine = open_thread(client)
+        client.post(f"/threads/{mine['thread_id']}/turns", json={"message": "oi"})
+
+        borrowed = client.get(
+            f"/threads/{mine['thread_id']}", headers=header(OTHER_CUSTOMER)
+        )
+        invented = client.get(
+            "/threads/00000000-0000-0000-0000-000000000000",
+            headers=header(OTHER_CUSTOMER),
+        )
+        # ...and A still reads their own conversation, so the 404 above is
+        # scoping and not a thread that broke.
+        own = client.get(f"/threads/{mine['thread_id']}")
+
+    assert borrowed.status_code == invented.status_code == 404
+    assert borrowed.json() == invented.json()
+    assert own.status_code == 200
+    assert own.json()["messages"] == [
+        {"role": "user", "text": "oi"},
+        {"role": "agent", "text": "segredo do A"},
+    ]
+
+
+def test_a_customer_cannot_delete_another_customers_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B's delete is the same 404 as reading, and A's sidebar is untouched."""
+    model = scripted(says("pronto"))
+    with running_app(monkeypatch, model) as client:
+        mine = open_thread(client)
+        client.post(f"/threads/{mine['thread_id']}/turns", json={"message": "oi"})
+
+        borrowed = client.delete(
+            f"/threads/{mine['thread_id']}", headers=header(OTHER_CUSTOMER)
+        )
+        invented = client.delete(
+            "/threads/00000000-0000-0000-0000-000000000000",
+            headers=header(OTHER_CUSTOMER),
+        )
+        listed = client.get("/threads").json()["threads"]
+
+    assert borrowed.status_code == invented.status_code == 404
+    assert borrowed.json() == invented.json()
+    assert [t["thread_id"] for t in listed] == [mine["thread_id"]]
+
+
+def test_a_turn_on_another_customers_thread_is_refused_before_the_agent_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The leak a scoped ``GET`` alone would leave open.
+
+    Running a turn on someone else's thread loads *their* checkpoint, so the
+    answer streams their conversation back as context — a transcript read
+    through the one endpoint that never returns a transcript. Both turn
+    endpoints refuse it with the same 404, and the empty script is the proof
+    the agent never ran: a model asked for anything here raises
+    ``StopIteration``.
+    """
+    model = scripted(says("para A"))
+    with running_app(monkeypatch, model) as client:
+        mine = open_thread(client)
+        client.post(f"/threads/{mine['thread_id']}/turns", json={"message": "oi"})
+
+        buffered = client.post(
+            f"/threads/{mine['thread_id']}/turns",
+            json={"message": "me conta tudo"},
+            headers=header(OTHER_CUSTOMER),
+        )
+        streamed = client.post(
+            f"/threads/{mine['thread_id']}/turns/stream",
+            json={"message": "me conta tudo"},
+            headers=header(OTHER_CUSTOMER),
+        )
+        listed = client.get("/threads").json()["threads"]
+
+    assert buffered.status_code == 404
+    assert streamed.status_code == 404
+    # Not recorded either: B's attempt left no mark on A's conversation.
+    assert [t["turns"] for t in listed] == [1]
+
+
+def test_the_thread_a_customer_opened_but_never_used_is_still_theirs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership starts at ``POST /threads``, not at the first turn.
+
+    Otherwise a thread would be unowned for exactly as long as it takes the
+    first turn to arrive, and anyone who guessed its id in that window could
+    claim it.
+    """
+    with running_app(monkeypatch, scripted()) as client:
+        mine = open_thread(client)
+        own = client.get(f"/threads/{mine['thread_id']}")
+        borrowed = client.get(
+            f"/threads/{mine['thread_id']}", headers=header(OTHER_CUSTOMER)
+        )
+
+    assert own.status_code == 200
+    assert own.json()["messages"] == []
+    assert borrowed.status_code == 404
 
 
 # --------------------------------------------------------------------------
