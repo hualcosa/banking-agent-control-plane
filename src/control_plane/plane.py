@@ -394,9 +394,20 @@ class ControlPlane:
         indistinguishable from one that never existed: both are ``[]``.
         """
         events = self.store.events_for(intent_id)
-        if self._principal_of(events) != (ctx.customer_id, ctx.session_id):
-            return []
-        return events
+        if self._principal_of(events) == (ctx.customer_id, ctx.session_id):
+            return events
+        # The trail follows the handoff. A customer who may confirm a
+        # voice-proposed intent from another channel must be able to ask why it
+        # happened from that same channel — "you may move the money but not see
+        # the reason" is the worse of the two consistent rules.
+        intent = self.store.get(intent_id)
+        if (
+            intent is not None
+            and intent.context.channel == "voice"
+            and self._same_customer(intent, ctx)
+        ):
+            return events
+        return []
 
     # ----------------------------------------------------------------------
     # internals
@@ -593,9 +604,31 @@ class ControlPlane:
 
     def _by_confirmation(self, ctx: Context, confirmation_id: str) -> Intent | None:
         intent = self.store.by_confirmation(confirmation_id)
-        if intent is None or not self._same_principal(intent, ctx):
+        if intent is None:
             return None
-        return intent
+        if self._same_principal(intent, ctx):
+            return intent
+        # Cross-channel confirmation, and only in this direction: an intent
+        # *proposed by voice* may be confirmed by the same customer from
+        # another channel. Reading a value and a recipient back over a phone
+        # line and accepting "sim" is the weakest confirmation this system
+        # could offer — a misheard yes and a misheard amount compound — so the
+        # channel that cannot confirm safely hands off to one that can.
+        #
+        # It is not a general loosening. The intent had to originate on voice,
+        # the customer must match, and every other channel still requires the
+        # same session: a "yes" typed in one text conversation is still not
+        # transferable to another.
+        if intent.context.channel == "voice" and self._same_customer(intent, ctx):
+            self.store.append(
+                intent.id,
+                "channel_handoff",
+                proposed_on=intent.context.channel,
+                confirmed_on=ctx.channel,
+                session=ctx.session_id,
+            )
+            return intent
+        return None
 
     @staticmethod
     def _principal_of(events: list[Event]) -> tuple[str, str] | None:
@@ -609,6 +642,10 @@ class ControlPlane:
             if "customer" in detail and "session" in detail:
                 return str(detail["customer"]), str(detail["session"])
         return None
+
+    @staticmethod
+    def _same_customer(intent: Intent, ctx: Context) -> bool:
+        return intent.context.customer_id == ctx.customer_id
 
     @staticmethod
     def _same_principal(intent: Intent, ctx: Context) -> bool:

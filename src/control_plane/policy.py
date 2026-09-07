@@ -68,6 +68,11 @@ BR_TZ = ZoneInfo("America/Sao_Paulo")
 #: An amount the risk engine calls unusual for this customer. Mocked: a real
 #: engine derives it from the customer's history.
 UNUSUAL_ABOVE = Decimal("500")
+#: Below this, the transcriber is not confident enough for the words to be
+#: taken at face value. Institution's choice, and the one number in this
+#: module a real deployment should tune against its own recogniser's
+#: calibration rather than inherit.
+HEARD_CLEARLY = 0.85
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,15 @@ def assess_risk(action: CreatePix, ctx: Context, *, known_recipients: set[str]) 
     if not ctx.device_trusted:
         signals.append("untrusted_device")
         score += 0.3
+    if ctx.stt_confidence is not None and ctx.stt_confidence < HEARD_CLEARLY:
+        # A transcript the recogniser is unsure of is not a weaker instruction,
+        # it is a different one: "trezentos" and "treze" differ by a factor of
+        # twenty, and "Renata" and "Renato" are different people. The signal is
+        # deliberately here, in risk, rather than as a rule of its own —
+        # uncertainty about what was said raises how carefully the action is
+        # treated; it does not decide the action.
+        signals.append("low_stt_confidence")
+        score += 0.4
     level: RiskLevel = "high" if score >= 0.6 else "medium" if score >= 0.3 else "low"
     return Risk(score=round(score, 2), level=level, signals=tuple(signals))
 

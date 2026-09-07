@@ -49,6 +49,13 @@ class Context(BaseModel):
     channel: Literal["whatsapp", "web", "mobile", "voice"] = "whatsapp"
     device_trusted: bool = True
     assurance: Assurance = "medium"
+    #: How sure the transcriber is that it heard the customer correctly, in
+    #: ``[0, 1]``. ``None`` means nobody transcribed anything — a typed
+    #: channel, where the question does not arise. Text channels leave it
+    #: ``None`` rather than claiming 1.0, because "certainly typed" and
+    #: "perfectly heard" are not the same fact and policy should be able to
+    #: tell them apart.
+    stt_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 # --------------------------------------------------------------------------
