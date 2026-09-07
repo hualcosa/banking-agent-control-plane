@@ -144,7 +144,14 @@ CREATE TABLE IF NOT EXISTS intents (
     -- that filters on one of them is a lookup that authorises too much.
     customer_id     TEXT        NOT NULL,
     session_id      TEXT        NOT NULL,
-    channel         TEXT        NOT NULL DEFAULT '',
+
+    -- The whole Context, not just its indexed halves. `assurance` lives here,
+    -- and `step_up` raises it: a schema that stored only customer/session/
+    -- channel would silently return an authenticated intent as medium-assurance
+    -- after a restart, and the policy would then demand a step-up the customer
+    -- already completed. The two columns above are duplicated out of this
+    -- object because they are what ownership queries filter on; nothing else is.
+    context         JSONB       NOT NULL,
 
     -- The canonical action, as the plane built it — never as the model typed
     -- it. JSONB because the action union grows (a scheduled PIX, a card block)
