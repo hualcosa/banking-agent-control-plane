@@ -18,8 +18,9 @@ and pipeline events (what was interpreted, what policy said, who confirmed).
 principal that wrote it. That reading — not the model's
 chain of thought — is the answer to "why did this action happen".
 
-# ponytail: in-process dicts and lists. Swap for two Postgres tables
-# (intents, ledger_events) in V1; the interface is `get`/`put`/`append`.
+# ponytail: `Ledger` is still the in-process implementation. The two Postgres
+# tables exist (intents, ledger_events) and `PgStore` writes them; this class is
+# what `MemoryStore` uses and what the unit tier runs on.
 """
 
 from __future__ import annotations

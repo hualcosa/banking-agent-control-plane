@@ -97,6 +97,22 @@ class Settings(BaseSettings):
 
     # --- Infrastructure ----------------------------------------------------
     database_url: str = "postgresql://trail:trail@postgres:5432/trail"
+
+    #: Where the control plane keeps intents and its ledger. ``memory`` is the
+    #: default so that a unit test, a REPL or a `python -c` never opens a
+    #: connection — and deliberately NOT derived from ``database_url`` being
+    #: set, because the test tier sets that variable and would then need a
+    #: database to run offline. The compose stack sets this to ``postgres``
+    #: for the services that serve traffic, which is what makes `trail intents`
+    #: and `trail reconcile` read the same state the agent writes.
+    control_plane_store: Literal["memory", "postgres"] = "memory"
+
+    #: Keys the digest that binds a confirmation to one exact action. Empty
+    #: falls back to the development default inside the control plane, which is
+    #: fine locally and is why the startup log says so when it happens: a
+    #: deployment that ships the dev key has a confirmation anyone who reads
+    #: this repository can forge.
+    confirmation_secret: SecretStr = SecretStr("")
     agent_base_url: str = "http://agent:8000"
 
     #: OTLP/HTTP+protobuf, full signal path. Langfuse does not accept OTLP over

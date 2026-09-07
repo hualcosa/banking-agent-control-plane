@@ -34,6 +34,7 @@ gets a plane of its own over that same ledger, with a bank of its own. See
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -49,11 +50,43 @@ from control_plane import (
     Outcome,
     ProposedPix,
 )
+from trail.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+def build_plane() -> ControlPlane:
+    """The template plane, with the storage the settings ask for.
+
+    This is the composition root: ``control_plane`` never imports ``trail``,
+    so the choice between a dict and a database is made *here*, by the example
+    that owns both. Getting this wrong is invisible until it matters —
+    a plane over ``MemoryStore`` serves traffic perfectly well and loses every
+    intent on restart, while `trail reconcile` reads a database nobody wrote
+    to and reports that a real payment never happened.
+
+    ``PgStore`` is imported inside the branch so that the default install does
+    not pay for psycopg, and so an import error names the missing extra rather
+    than failing at module import for callers who asked for ``memory``.
+    """
+    settings = get_settings()
+    secret = settings.confirmation_secret.get_secret_value() or None
+    if settings.control_plane_store == "memory":
+        return ControlPlane(secret=secret)
+
+    from control_plane.pgstore import PgStore
+
+    logger.info(
+        "control plane on postgres: %s",
+        settings.database_url.rsplit("@", 1)[-1],
+    )
+    return ControlPlane(store=PgStore(settings.database_url), secret=secret)
+
 
 #: The template every conversation's plane is derived from. Still a module
 #: attribute, and still the thing a test replaces: swapping it swaps the bank,
 #: the clock and the ledger every scope is built over.
-PLANE = ControlPlane()
+PLANE = build_plane()
 
 #: ``template plane → {(customer, session): plane}``. Weak on the template so
 #: that replacing ``PLANE`` — a test's monkeypatch, a re-import — drops every

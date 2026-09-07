@@ -18,8 +18,9 @@ Every method takes a :class:`Context` and every intent remembers the one that
 created it. A confirmation is honoured only from the same customer **and** the
 same session — a "yes" cannot be borrowed across conversations.
 
-# ponytail: one instance per process, dicts for storage. V1 is the same class
-# over Postgres and a per-request instance; nothing here touches a framework.
+# ponytail: one instance per process. Storage is behind `Store` now, so
+# `PgStore` is a constructor argument rather than a rewrite; what remains is
+# that the instance is long-lived instead of per-request.
 """
 
 from __future__ import annotations

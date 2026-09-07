@@ -465,3 +465,48 @@ def test_the_banking_example_is_registered() -> None:
     }
     assert golden.version.startswith("banking-")
     assert "fabrication_rate" in golden.thresholds
+
+
+# --------------------------------------------------------------------------
+# the composition root
+# --------------------------------------------------------------------------
+
+
+def test_the_store_is_chosen_by_settings_not_by_accident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`control_plane` never imports `trail`, so the choice between a dict and
+    a database is made here, by the example that owns both.
+
+    Getting it wrong is invisible until it matters: a plane over `MemoryStore`
+    serves traffic perfectly well and loses every intent on restart, while
+    `trail reconcile` reads a database nobody wrote to and reports that a real
+    payment never happened.
+    """
+    from control_plane.store import MemoryStore
+    from examples.banking.tools import build_plane
+    from trail.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("TRAIL_CONTROL_PLANE_STORE", "memory")
+    assert isinstance(build_plane().store, MemoryStore)
+    get_settings.cache_clear()
+
+
+def test_the_confirmation_secret_comes_from_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment that ships the development key has a confirmation anyone
+    who can read this repository is able to forge."""
+    from examples.banking.tools import build_plane
+    from trail.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("TRAIL_CONTROL_PLANE_STORE", "memory")
+    monkeypatch.setenv("TRAIL_CONFIRMATION_SECRET", "not-the-dev-default")
+    assert build_plane().secret == "not-the-dev-default"
+
+    monkeypatch.delenv("TRAIL_CONFIRMATION_SECRET")
+    get_settings.cache_clear()
+    assert build_plane().secret == "trail-dev-confirmation"
+    get_settings.cache_clear()

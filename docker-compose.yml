@@ -39,6 +39,13 @@ x-trail-env: &trail-env
   TRAIL_AGENT: ${TRAIL_AGENT:-banking}
   TRAIL_GUARDRAILS: ${TRAIL_GUARDRAILS:-both}
   TRAIL_CHECKPOINTER: ${TRAIL_CHECKPOINTER:-postgres}
+  # The control plane's own state — intents and the ledger — on the same
+  # Postgres. Separate from TRAIL_CHECKPOINTER because they are different data
+  # with different owners: LangGraph owns the conversation, this owns money.
+  # `postgres` here is what makes `trail intents` and `trail reconcile` read
+  # the state the agent actually wrote; on `memory` they would open a database
+  # nobody writes to and report that a real payment never happened.
+  TRAIL_CONTROL_PLANE_STORE: ${TRAIL_CONTROL_PLANE_STORE:-postgres}
   # The one address here that is deliberately NOT a container name. The agent
   # stamps a Langfuse deep link onto every response so the UI can offer "see
   # the trace", and that link is resolved by a browser on the host, not by a

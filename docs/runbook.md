@@ -68,7 +68,13 @@ próprio `intent_id`) e escreve no ledger o que o banco respondeu.
 
 ## 3. Antes de começar
 
-1. `TRAIL_DATABASE_URL` tem que apontar para o **mesmo** Postgres do agente.
+1. `TRAIL_DATABASE_URL` tem que apontar para o **mesmo** Postgres do agente, e
+   o agente tem que estar gravando lá: `TRAIL_CONTROL_PLANE_STORE=postgres`
+   (é o que o `docker-compose.yml` define para os serviços que atendem
+   tráfego). Com `memory`, o agente guarda os intents no próprio processo e
+   estes comandos abrem um banco em que ninguém escreveu — `trail intents`
+   não lista nada e `trail reconcile` responde `FAILED` para um pagamento que
+   de fato saiu. Confira antes de confiar na saída.
    De fora do compose o host é `localhost`; `make intents` e `make reconcile`
    já montam isso para você.
 2. `TRAIL_CUSTOMER_ID` é o cliente cujos intents você enxerga. A lista é
