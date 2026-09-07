@@ -241,7 +241,7 @@ class ControlPlane:
         is the binding — the upgrade applies to this intent only, and the
         policy is evaluated again rather than skipped.
         """
-        intent = self._owned(ctx, intent_id)
+        intent = self._owned_by_customer(ctx, intent_id)
         if intent is None:
             return self._unknown(intent_id)
         if intent.state != "AWAITING_STEP_UP":
@@ -340,7 +340,7 @@ class ControlPlane:
 
     def reconcile(self, ctx: Context, intent_id: str) -> Outcome:
         """Resolve ``UNKNOWN`` by asking the bank what it did. Never re-pays."""
-        intent = self._owned(ctx, intent_id)
+        intent = self._owned_by_customer(ctx, intent_id)
         if intent is None:
             return self._unknown(intent_id)
         if intent.state != "UNKNOWN":
@@ -563,6 +563,27 @@ class ControlPlane:
         return Outcome(
             status="DENY", message=f"referência desconhecida para esta sessão: {ref}"
         )
+
+    def _owned_by_customer(self, ctx: Context, intent_id: str) -> Intent | None:
+        """The intent, if this *customer* owns it — session not compared.
+
+        Deliberately weaker than :meth:`_owned`, and only two callers may use
+        it. Step-up is out-of-band by definition: the approval arrives from the
+        bank's app, a different process with a different session, so requiring
+        the same session would refuse 100% of real callbacks. Reconciliation is
+        the same shape — an operator running the runbook at 3am is not in the
+        customer's chat thread.
+
+        What this does NOT weaken is consent. ``confirm`` still requires the
+        same customer AND the same session, because a "yes" is said in a
+        conversation and must not be borrowable from another one. Raising
+        assurance and asking the bank what it did are both safe to do from
+        elsewhere; agreeing to move money is not.
+        """
+        intent = self.store.get(intent_id)
+        if intent is None or intent.context.customer_id != ctx.customer_id:
+            return None
+        return intent
 
     def _owned(self, ctx: Context, intent_id: str) -> Intent | None:
         intent = self.store.get(intent_id)

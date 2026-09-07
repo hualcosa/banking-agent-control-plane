@@ -288,11 +288,32 @@ def test_high_risk_triggers_step_up_below_the_amount_threshold(
     assert risk.detail["level"] == "high"
 
 
-def test_step_up_is_bound_to_one_intent(plane: ControlPlane) -> None:
+def test_step_up_is_bound_to_the_customer_not_the_session(
+    plane: ControlPlane,
+) -> None:
+    """Step-up arrives from the bank's app, which is another process with
+    another session — so requiring the same session would refuse every real
+    callback. It is bound to the customer and the intent instead. The customer
+    boundary does not move: another customer is still refused, and so is an
+    id that does not exist."""
     proposed = plane.propose(CTX, pix("Renata", "1500"))
-    assert plane.step_up(OTHER_SESSION, proposed.intent_id).status == "DENY"
+    assert plane.step_up(OTHER_CUSTOMER, proposed.intent_id).status == "DENY"
     assert plane.step_up(CTX, "pix_nope").status == "DENY"
     assert plane.intents[proposed.intent_id].state == "AWAITING_STEP_UP"
+
+    assert plane.step_up(OTHER_SESSION, proposed.intent_id).status == (
+        "REQUIRE_CONFIRMATION"
+    )
+    assert plane.intents[proposed.intent_id].context.assurance == "strong"
+
+
+def test_consent_is_still_bound_to_the_conversation(plane: ControlPlane) -> None:
+    """The other half of that decision, asserted next to it: loosening
+    step-up must not loosen `confirm`. A "yes" is said in a conversation and
+    cannot be borrowed from another one, even by the same customer."""
+    proposed = plane.propose(CTX, pix("Renata", "300"))
+    assert plane.confirm(OTHER_SESSION, proposed.confirmation_id).status == "DENY"
+    assert plane.bank.payments == {}
 
 
 def test_step_up_on_the_wrong_state_is_refused(plane: ControlPlane) -> None:

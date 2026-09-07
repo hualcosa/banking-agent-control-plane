@@ -21,11 +21,13 @@ from __future__ import annotations
 import io
 import types
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import httpx
 import pytest
 from rich.console import Console
 
+from control_plane import Context, CreatePix, Intent, MemoryStore, MockBank
 from trail import cli
 from trail.config import get_settings
 from trail.evals import store as store_module
@@ -864,3 +866,258 @@ async def test_chat_refuses_to_run_with_no_identity_secret(
     with pytest.raises(cli.CliError) as raised:
         await cli.chat("http://agent")
     assert "TRAIL_IDENTITY_SECRET" in str(raised.value)
+
+
+# ---------------------------------------------------------------------------
+# Out of band: step-up, intents, reconcile
+#
+# These three never speak HTTP, so there is no transport to fake — the seam is
+# the storage. ``operator_cli`` swaps ``PgStore`` for a ``MemoryStore``, which
+# satisfies the same protocol, so what runs below is the real ``ControlPlane``
+# over real state: an assertion here is an assertion about the plane's answer
+# and not about a mock's. It also replaces ``httpx`` with one that raises,
+# which is how "out of band" stops being a claim in a docstring: a command
+# that reached the agent would fail the test that says it does not.
+# ---------------------------------------------------------------------------
+
+
+def no_http() -> types.SimpleNamespace:
+    """An ``httpx`` stand-in that refuses to build a client at all."""
+
+    def explode(**kw: object) -> httpx.AsyncClient:  # pragma: no cover
+        raise AssertionError("an out-of-band command must not reach the agent")
+
+    return types.SimpleNamespace(AsyncClient=explode, HTTPError=httpx.HTTPError)
+
+
+def operator_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bank: MockBank | None = None,
+) -> MemoryStore:
+    """Point the out-of-band commands at in-memory state and forbid HTTP."""
+    store = MemoryStore()
+    the_bank = MockBank() if bank is None else bank
+    monkeypatch.setattr(cli, "PgStore", lambda dsn: store)
+    monkeypatch.setattr(cli, "MockBank", lambda: the_bank)
+    monkeypatch.setattr(cli, "httpx", no_http())
+    # Rich wraps table cells to the console width, and a wrapped id is a
+    # substring assertion that fails for a cosmetic reason.
+    monkeypatch.setenv("COLUMNS", "200")
+    return store
+
+
+def an_intent(
+    store: MemoryStore,
+    *,
+    intent_id: str,
+    state: str = "UNKNOWN",
+    customer: str = "cust_123",
+    session: str = "thread_da_conversa",
+    amount: str = "800.00",
+    recipient: str = "contact_joao",
+) -> Intent:
+    """One intent in the store, in whatever state the test needs it in."""
+    intent = Intent(
+        id=intent_id,
+        action=CreatePix(
+            source_account="checking_001",
+            recipient_id=recipient,
+            amount=Decimal(amount),
+        ),
+        context=Context(customer_id=customer, session_id=session),
+        state=state,  # type: ignore[arg-type]  # a literal from State
+    )
+    store.put(intent)
+    return intent
+
+
+def test_the_out_of_band_commands_take_no_base_url() -> None:
+    """They do not know the agent exists, so there is nothing to point at."""
+    parser = build = cli.build_parser()
+    assert not hasattr(build.parse_args(["intents"]), "base_url")
+    assert parser.parse_args(["step-up", "pix_1"]).intent_id == "pix_1"
+    assert parser.parse_args(["reconcile", "pix_1"]).intent_id == "pix_1"
+
+
+def test_redact_hides_the_password_and_keeps_everything_useful() -> None:
+    assert (
+        cli.redact("postgresql://trail:s3cr3t@db.internal:5432/trail")
+        == "postgresql://trail:***@db.internal:5432/trail"
+    )
+    # No host to redact around, so nothing is invented.
+    assert cli.redact("sqlite:///local.db") == "sqlite:///local.db"
+
+
+def test_intents_lists_what_needs_a_person_and_names_the_command_for_each(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = operator_cli(monkeypatch)
+    an_intent(store, intent_id="pix_parado", state="UNKNOWN")
+    an_intent(store, intent_id="pix_esperando", state="AWAITING_STEP_UP")
+    an_intent(store, intent_id="pix_pronto", state="COMPLETED")
+
+    assert cli.main(["intents"]) == 0
+    out = capsys.readouterr().out
+
+    assert "trail reconcile pix_parado" in out
+    assert "trail step-up pix_esperando" in out
+    # A settled intent is not waiting on anybody and must not be in the way.
+    assert "pix_pronto" not in out
+    # UNKNOWN leads the list: it is the one whose truth lives at the bank.
+    assert out.index("pix_parado") < out.index("pix_esperando")
+    assert "1 em UNKNOWN" in out
+
+
+def test_intents_shows_only_the_configured_customer(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The database is shared; the list is not. Ownership is not the store's job."""
+    store = operator_cli(monkeypatch)
+    an_intent(store, intent_id="pix_meu", customer="cust_123")
+    an_intent(store, intent_id="pix_alheio", customer="cust_999")
+
+    assert cli.main(["intents"]) == 0
+    out = capsys.readouterr().out
+    assert "pix_meu" in out
+    assert "pix_alheio" not in out
+
+
+def test_intents_says_plainly_when_there_is_nothing_to_do(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operator_cli(monkeypatch)
+    assert cli.main(["intents"]) == 0
+    assert "nada aguardando" in capsys.readouterr().out
+
+
+def test_step_up_for_another_customer_is_refused(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loosening ownership to the customer must not loosen it past the customer.
+
+    This is the guard on the change T10 asks for: the session may differ, the
+    customer may not. It passes today and must still pass afterwards.
+    """
+    store = operator_cli(monkeypatch)
+    an_intent(
+        store, intent_id="pix_alheio", state="AWAITING_STEP_UP", customer="cust_999"
+    )
+
+    assert cli.main(["step-up", "pix_alheio"]) == 1
+    assert "referência desconhecida" in capsys.readouterr().out
+    assert store.get("pix_alheio").state == "AWAITING_STEP_UP"
+
+
+def test_step_up_from_another_process_reaches_the_confirmation(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of T10, asserted end to end through the CLI.
+
+    The CLI's session is new on every invocation, so this only reaches the
+    confirmation because ``ControlPlane.step_up`` resolves the intent through
+    ``_owned_by_customer`` — customer plus intent id — rather than through
+    ``_same_principal``, which compares the session and would refuse every
+    real out-of-band callback.
+
+    R$ 800,00 to a recipient never paid before scores ``high`` — so policy asks
+    for strong assurance below the amount threshold, and the amount stays under
+    the nighttime cap, which keeps this test independent of the hour it runs
+    at (the CLI builds its own plane and injects no clock).
+
+    The last assertion is the half that must *not* loosen: step-up grants
+    assurance, never consent. The confirmation still belongs to the session
+    that proposed the payment.
+    """
+    store = operator_cli(monkeypatch)
+    an_intent(store, intent_id="pix_forte", state="AWAITING_STEP_UP")
+
+    code = cli.main(["step-up", "pix_forte"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "REQUIRE_CONFIRMATION" in out
+    settled = store.get("pix_forte")
+    assert settled.state == "AWAITING_CONFIRMATION"
+    assert settled.context.assurance == "strong"
+    assert settled.context.session_id == "thread_da_conversa"
+
+
+def test_reconcile_names_how_many_payments_the_bank_it_asked_knows(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V0's bank is per process, so the CLI's bank starts empty — and says so.
+
+    A ``FAILED`` printed under "0 pagamento(s) conhecido(s)" is not evidence
+    that the money did not move; it is evidence that the book being asked has
+    never seen a payment. The runbook turns that distinction into a rule, and
+    this test is what keeps the line on screen.
+    """
+    store = operator_cli(monkeypatch)
+    an_intent(store, intent_id="pix_parado", state="UNKNOWN")
+
+    cli.main(["reconcile", "pix_parado"])
+    out = capsys.readouterr().out
+    assert "MockBank" in out and "0 pagamento(s) conhecido(s)" in out
+    assert "nenhum pagamento novo" in out
+
+
+def test_reconcile_completes_an_intent_the_bank_had_already_paid(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 3am path: UNKNOWN in, the bank's own answer out, no second debit.
+
+    Like step-up, this runs as a principal with a session the intent has never
+    seen — an operator is not in the customer's chat thread — so it depends on
+    ``reconcile`` resolving ownership through ``_owned_by_customer`` too.
+    """
+    bank = MockBank()
+    receipt = {
+        "payment_id": "pay_ja_feito",
+        "end_to_end_id": "E123",
+        "status": "COMPLETED",
+        "amount": "800.00",
+        "recipient_id": "contact_joao",
+    }
+    bank.payments["pix_parado"] = receipt  # the idempotency key is the intent id
+    balance_before = bank.accounts["checking_001"]
+    store = operator_cli(monkeypatch, bank=bank)
+    an_intent(store, intent_id="pix_parado", state="UNKNOWN")
+
+    code = cli.main(["reconcile", "pix_parado"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "COMPLETED" in out and "pay_ja_feito" in out
+    assert store.get("pix_parado").state == "COMPLETED"
+    # Reconciliation asks; it never pays.
+    assert bank.payments == {"pix_parado": receipt}
+    assert bank.accounts["checking_001"] == balance_before
+
+
+def test_a_database_it_cannot_reach_is_a_message_and_never_the_password(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(dsn: str) -> object:
+        raise OSError("connection refused")
+
+    monkeypatch.setenv("TRAIL_DATABASE_URL", "postgresql://trail:s3cr3t@db:5432/trail")
+    get_settings.cache_clear()
+    monkeypatch.setattr(cli, "PgStore", refuse)
+
+    assert cli.main(["intents"]) == 1
+    err = capsys.readouterr().err
+    assert "db:5432" in err and "***" in err
+    assert "s3cr3t" not in err
+    assert "make up" in err
+
+
+def test_a_missing_api_key_names_the_variable_instead_of_raising(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """These commands never call a model, so the failure has to explain itself."""
+    monkeypatch.delenv("TRAIL_LLM_API_KEY", raising=False)
+    get_settings.cache_clear()
+
+    assert cli.main(["intents"]) == 1
+    assert "TRAIL_LLM_API_KEY" in capsys.readouterr().err
