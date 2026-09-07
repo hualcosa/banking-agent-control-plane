@@ -1,4 +1,4 @@
-"""A chat model that answers from a script, so the unit tier can stay offline.
+"""Test doubles: a chat model that answers from a script, and a bank that dies.
 
 ``make test`` runs with no Docker, no database, no network and a deliberately
 invalid API key, and that constraint is what keeps the suite runnable during
@@ -14,14 +14,26 @@ actually runs is the graph's business and therefore the thing under test.
 Putting a tool call in the script drives the real tool node, the real
 ``wrap_tool_call`` hook and the real rail frame. Nothing about the path is
 simulated except the model's decision to take it.
+
+:class:`FaultyBank` is the same idea one layer down. ``MockBank`` already
+simulates the two *handled* failures — a refusal and a timeout — and the
+control plane has an answer for both. What it has no answer for is the
+process simply ending: the crash window of adversary **A15**, between the
+``execution_request`` event and the receipt. So the fake raises something the
+plane does not catch, at a point the caller chooses, and the interesting
+point is *after* the money moved.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any, Literal
 
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
+
+from control_plane.bank import MockBank
 
 
 class ScriptedModel(GenericFakeChatModel):
@@ -67,3 +79,51 @@ def calls(tool: str, call_id: str = "call_1", **args: Any) -> AIMessage:
         content="",
         tool_calls=[{"name": tool, "args": args, "id": call_id, "type": "tool_call"}],
     )
+
+
+class Crash(Exception):
+    """The process ending, as an exception. Deliberately not a ``BankError``.
+
+    ``BankError`` and ``BankTimeout`` are *outcomes*: the plane catches both
+    and writes what happened. A crash is the absence of an outcome, so this
+    inherits from neither — nothing in ``plane.py`` catches it, which is the
+    whole point. Seeing this escape a call is the test saying "here the
+    process died".
+    """
+
+
+@dataclass
+class FaultyBank(MockBank):
+    """A bank that dies mid-call, at a point the test names.
+
+    ``crash_at="after_pay"`` is the case worth having: ``create_pix`` debits
+    the account and files the receipt exactly as :class:`MockBank` does, and
+    only *then* raises :class:`Crash` — the money is gone and the caller never
+    found out. That is the state a customer pays twice from.
+
+    ``crash_at="before_pay"`` is its twin, and the reason a restart sweep may
+    not simply assume the worst: from the ledger alone the two are
+    indistinguishable, and only the bank can tell them apart.
+    """
+
+    crash_at: Literal["before_pay", "after_pay"] | None = None
+
+    def create_pix(
+        self,
+        *,
+        idempotency_key: str,
+        source_account: str,
+        recipient_id: str,
+        amount: Decimal,
+    ) -> dict[str, Any]:
+        if self.crash_at == "before_pay":
+            raise Crash("process died before the bank was called")
+        receipt = super().create_pix(
+            idempotency_key=idempotency_key,
+            source_account=source_account,
+            recipient_id=recipient_id,
+            amount=amount,
+        )
+        if self.crash_at == "after_pay":
+            raise Crash("process died after the bank paid, before the receipt")
+        return receipt
