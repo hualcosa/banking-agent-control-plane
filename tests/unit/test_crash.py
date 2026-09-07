@@ -12,7 +12,8 @@ literal: throw the `ControlPlane` away and build a new one over the *same*
 is provable before Postgres exists.
 
 These tests assert what is true today, gaps included. Every assertion marked
-"the gap" is a fact this repository intends to stop being true — **T7 closes
+"the gap" is a fact this repository intends to stop being true — **the sweep
+(`ControlPlane.sweep`, tested in `test_recovery.py`) closes
 it** with the restart sweep. What is asserted as a guarantee, and must never
 regress, is the money: the bank is paid exactly once, across the crash and
 across the restart.
@@ -79,7 +80,7 @@ def test_the_crash_lands_inside_the_window_it_claims_to_test() -> None:
 
 def test_after_a_crash_the_intent_is_stranded_in_submitted() -> None:
     """The gap. A restart inherits an intent that is neither settled nor
-    moving, and no code path takes it anywhere. **T7 closes this** by sweeping
+    moving, and no code path takes it anywhere. **`ControlPlane.sweep()` closes this** by sweeping
     `SUBMITTED → UNKNOWN` on start-up; until then this is the honest state of
     the system and the test says so out loud."""
     bank, store = FaultyBank(crash_at="after_pay"), MemoryStore()
@@ -88,14 +89,18 @@ def test_after_a_crash_the_intent_is_stranded_in_submitted() -> None:
     restarted = plane_over(bank, store)
     assert restarted.store.get(intent_id).state == "SUBMITTED"
     assert restarted.status(CTX, intent_id).data["state"] == "SUBMITTED"
-    # The query T7 will ask on start-up already answers. Nobody asks it yet.
+    # The query the sweep asks on start-up. These tests deliberately do not
+    # call it: what is asserted here is the state a crash leaves *before*
+    # anyone resolves it.
     assert [i.id for i in store.unsettled(["SUBMITTED"])] == [intent_id]
 
 
 def test_reconcile_refuses_a_stranded_intent_because_it_only_takes_unknown() -> None:
     """The gap, from the customer's side: the one operation that could find
     the money declines to look, because the intent never reached `UNKNOWN`.
-    **T7 closes this** — the sweep is what puts it there. Note the refusal is
+    **`sweep()` closes this** — it is what puts the intent in UNKNOWN, and
+    `test_recovery.py` drives the whole crash → sweep → reconcile path. Note
+    the refusal here is
     still safe: refusing to look never pays twice."""
     bank, store = FaultyBank(crash_at="after_pay"), MemoryStore()
     intent_id = crash_mid_payment(bank, store)
@@ -110,7 +115,7 @@ def test_reconcile_refuses_a_stranded_intent_because_it_only_takes_unknown() -> 
 
 
 def test_the_bank_is_paid_exactly_once_across_the_crash_and_the_restart() -> None:
-    """The guarantee, not a gap. Whatever T7 changes about the state, this is
+    """The guarantee, not a gap. Whatever the sweep changes about the state, this is
     the invariant (**I1**) that must survive it: one intent, one debit, no
     blind retry — including when the agent repeats its confirmation to a
     freshly started process."""
@@ -131,7 +136,7 @@ def test_the_bank_is_paid_exactly_once_across_the_crash_and_the_restart() -> Non
 def test_a_crash_before_the_call_looks_identical_from_storage() -> None:
     """Why the sweep cannot simply assume the money moved. Same stranded
     `SUBMITTED`, same ledger, and nothing debited — only the bank knows the
-    difference, which is precisely what `reconcile` is for once T7 hands it an
+    difference, which is precisely what `reconcile` is for once the sweep hands it an
     `UNKNOWN` to work on."""
     bank, store = FaultyBank(crash_at="before_pay"), MemoryStore()
     intent_id = crash_mid_payment(bank, store)

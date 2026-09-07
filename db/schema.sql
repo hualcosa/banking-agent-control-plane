@@ -171,6 +171,14 @@ CREATE TABLE IF NOT EXISTS intents (
     -- can expire (T8) — a column written and never read is exactly how "old
     -- confirmation" became unexpressable in V0.
     confirmation_id TEXT,
+
+    -- When the token was issued, and what the action hashed to at that moment.
+    -- These are the two columns whose absence made "old confirmation" and
+    -- "mutated action" unexpressable: not scenarios the system got wrong, but
+    -- scenarios it could not be wrong about, because it kept nothing to check.
+    confirmation_issued_at TIMESTAMPTZ,
+    action_digest   TEXT,
+
     confirmed_at    TIMESTAMPTZ,
     confirmed_by    TEXT,
 

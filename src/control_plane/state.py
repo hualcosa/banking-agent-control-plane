@@ -24,7 +24,10 @@ chain of thought — is the answer to "why did this action happen".
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
+from datetime import datetime, timedelta, timezone
 from secrets import token_hex
 from typing import Any, Literal
 
@@ -104,6 +107,14 @@ class Intent(BaseModel):
     #: The token the customer confirms. Issued on entering
     #: ``AWAITING_CONFIRMATION``; binds a "yes" to this exact object.
     confirmation_id: str | None = None
+    #: When the token was issued. A confirmation is consent to act *now*, so
+    #: it expires: without this field "the customer said yes yesterday" is not
+    #: a scenario the system can be wrong about, because it cannot tell.
+    confirmation_issued_at: datetime | None = None
+    #: A digest of the action as it was when the token was issued. Consent is
+    #: to one exact object, and this is what makes that checkable rather than
+    #: merely intended — see :func:`action_digest`.
+    action_digest: str | None = None
     confirmed_at: datetime | None = None
     confirmed_by: str | None = None
     #: What the bank answered. ``None`` until ``SUBMITTED`` resolves.
@@ -142,6 +153,27 @@ class Ledger:
 
     def __len__(self) -> int:
         return len(self._events)
+
+
+#: How long a "yes" is good for. Short on purpose: a confirmation is consent
+#: to move money now, and the customer who said it is still in the
+#: conversation. Long enough to survive a slow reply, not long enough for the
+#: phone to change hands.
+CONFIRMATION_TTL = timedelta(minutes=5)
+
+
+def action_digest(action: CreatePix, secret: str) -> str:
+    """A tamper-evident fingerprint of the action a token was issued against.
+
+    Keyed rather than a bare hash: an unkeyed digest tells you the action
+    changed, but anyone who can write an intent can also recompute the digest
+    to match. The key is what makes the two writes require two capabilities.
+
+    The payload is the action's canonical JSON with sorted keys, so the digest
+    depends on the *values* and not on field order or dict iteration.
+    """
+    payload = json.dumps(action.model_dump(mode="json"), sort_keys=True)
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
 def transition(intent: Intent, event: str, ledger: Ledger, **detail: Any) -> Intent:

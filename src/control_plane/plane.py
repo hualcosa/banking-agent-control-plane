@@ -24,6 +24,8 @@ same session — a "yes" cannot be borrowed across conversations.
 
 from __future__ import annotations
 
+import hmac
+import os
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
@@ -44,9 +46,11 @@ from control_plane.actions import (
 from control_plane.bank import BankError, BankTimeout, MockBank
 from control_plane.policy import Decision, Verdict, assess_risk, evaluate
 from control_plane.state import (
+    CONFIRMATION_TTL,
     Event,
     IllegalTransition,
     Intent,
+    action_digest,
     new_id,
     now,
     transition,
@@ -93,10 +97,20 @@ class ControlPlane:
         *,
         clock: Callable[[], datetime] | None = None,
         store: Store | None = None,
+        secret: str | None = None,
     ) -> None:
         self.bank = bank if bank is not None else MockBank()
         self.clock = clock if clock is not None else now
         self.store: Store = store if store is not None else MemoryStore()
+        #: Keys the action digest. Read from the environment so it is stable
+        #: across a restart — a per-process random value would invalidate
+        #: every outstanding confirmation every time the container moved,
+        #: which is an outage dressed as a security control.
+        self.secret = (
+            secret
+            if secret is not None
+            else os.environ.get("TRAIL_CONFIRMATION_SECRET", "trail-dev-confirmation")
+        )
 
     @property
     def intents(self) -> Mapping[str, Intent]:
@@ -259,6 +273,38 @@ class ControlPlane:
                 intent, "essa ação não está aguardando confirmação", status="DENY"
             )
 
+        # A "yes" is consent to move money *now*. An expired one is not a
+        # weaker yes, it is not a yes — so the intent is cancelled rather than
+        # left waiting for a token that will never get younger.
+        if self._expired(intent):
+            self.store.append(
+                intent.id,
+                "confirmation_expired",
+                issued_at=intent.confirmation_issued_at.isoformat(),
+                ttl_seconds=int(CONFIRMATION_TTL.total_seconds()),
+            )
+            self._move(intent, "cancel", reason="confirmation_expired")
+            intent.reason = "confirmação expirada; proponha novamente"
+            self.store.put(intent)
+            return self._status(intent, intent.reason)
+
+        # Consent was to one exact object. If the action no longer hashes to
+        # what the token was issued against, something rewrote it after the
+        # customer agreed — and no answer to that is safe except refusal.
+        current = action_digest(intent.action, self.secret)
+        if not hmac.compare_digest(current, intent.action_digest or ""):
+            self.store.append(
+                intent.id,
+                "digest_mismatch",
+                expected=intent.action_digest,
+                actual=current,
+            )
+            return self._status(
+                intent,
+                "a ação mudou depois da confirmação; nada foi executado",
+                status="DENY",
+            )
+
         intent.confirmed_at = self.clock()
         intent.confirmed_by = ctx.customer_id
         self.store.put(intent)
@@ -310,6 +356,31 @@ class ControlPlane:
         self._move(intent, "complete", reconciled=True)
         return self._status(intent, "confirmado junto ao banco: o pagamento foi feito")
 
+    def sweep(self) -> list[str]:
+        """Resolve what the last process left mid-flight. Call once, on boot.
+
+        An intent in ``SUBMITTED`` means the bank was called and the answer
+        never arrived — the process died between the two writes. That is not
+        ``FAILED``: the money may well have moved, and treating it as failure
+        is how a customer pays twice. It is ``UNKNOWN``, which is a state with
+        a way out, and the edge ``("SUBMITTED", "timeout") → UNKNOWN`` already
+        existed for the timeout case. A crash and a timeout leave the same
+        evidence, so they get the same answer, and ``reconcile`` asks the bank.
+
+        Takes no ``Context``: nobody is calling, the process is starting. That
+        is exactly why it is a separate method rather than a branch inside one
+        of the request paths — it is the one operation with no principal.
+        """
+        stranded = self.store.unsettled(["SUBMITTED"])
+        for intent in stranded:
+            self.store.append(
+                intent.id, "restart_sweep", found_in="SUBMITTED", resolved_to="UNKNOWN"
+            )
+            self._move(intent, "timeout", by="restart_sweep")
+            intent.reason = "processo reiniciou antes da resposta do banco"
+            self.store.put(intent)
+        return [i.id for i in stranded]
+
     def status(self, ctx: Context, intent_id: str) -> Outcome:
         intent = self._owned(ctx, intent_id)
         return self._unknown(intent_id) if intent is None else self._status(intent)
@@ -330,6 +401,13 @@ class ControlPlane:
     # ----------------------------------------------------------------------
     # internals
     # ----------------------------------------------------------------------
+
+    def _expired(self, intent: Intent) -> bool:
+        """Has the token outlived its TTL? No issue time means no expiry —
+        an intent from before this field existed is not retroactively stale."""
+        if intent.confirmation_issued_at is None:
+            return False
+        return self.clock() - intent.confirmation_issued_at > CONFIRMATION_TTL
 
     def _move(self, intent: Intent, event: str, **detail: Any) -> Intent:
         """One hop of the state machine, then saved.
@@ -380,8 +458,13 @@ class ControlPlane:
             )
         if verdict.decision == "REQUIRE_CONFIRMATION":
             intent.confirmation_id = new_id("conf")
+            intent.confirmation_issued_at = self.clock()
+            intent.action_digest = action_digest(intent.action, self.secret)
             self._move(
-                intent, "await_confirmation", confirmation_id=intent.confirmation_id
+                intent,
+                "await_confirmation",
+                confirmation_id=intent.confirmation_id,
+                digest=intent.action_digest,
             )
             return Outcome(
                 status="REQUIRE_CONFIRMATION",

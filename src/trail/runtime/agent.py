@@ -21,7 +21,7 @@ itself by the time the rail's closing frame is emitted.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,6 +51,14 @@ class AgentSpec:
     #: Shown by the client as the opening line. Not a model call: an agent that
     #: burns a turn to say hello is charging for a greeting.
     greeting: str = ""
+    #: Run once at boot, before the first request. Returns lines to log.
+    #:
+    #: The runtime knows nothing about what an example needs to do on start-up
+    #: — the banking example sweeps intents its previous process left
+    #: mid-payment, which requires a control plane this module must never
+    #: import. A callable on the spec keeps that dependency pointing the right
+    #: way: the example depends on the runtime, never the reverse.
+    on_startup: Callable[[], Sequence[str]] | None = None
 
 
 def build_model(settings: Settings) -> Any:

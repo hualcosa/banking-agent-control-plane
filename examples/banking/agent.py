@@ -11,7 +11,7 @@ Nothing in this module imports LangChain or the bank.
 
 from __future__ import annotations
 
-from examples.banking.tools import TOOLS
+from examples.banking.tools import PLANE, TOOLS
 from trail.config import get_settings
 from trail.runtime.agent import AgentSpec
 from trail.runtime.middleware.guards import (
@@ -71,6 +71,25 @@ OUTPUT_REFUSAL = (
 )
 
 
+def sweep_on_boot() -> list[str]:
+    """Resolve whatever the last process left mid-payment.
+
+    An intent in ``SUBMITTED`` means the bank was called and the answer never
+    came back — the process died between the two writes. It has no way out on
+    its own: ``reconcile`` only accepts ``UNKNOWN``. Moving it there is what
+    turns a crashed container into a recoverable event, and the operator needs
+    to see the ids, because each one is now a payment whose truth lives at the
+    bank and not here. The runbook takes it from there.
+    """
+    swept = PLANE.sweep()
+    if not swept:
+        return []
+    return [
+        f"restart sweep: {len(swept)} intent(s) left in SUBMITTED moved to "
+        f"UNKNOWN, awaiting reconciliation: {', '.join(swept)}"
+    ]
+
+
 def build() -> AgentSpec:
     """The spec the runtime mounts for ``TRAIL_AGENT=banking``."""
     settings = get_settings()
@@ -79,6 +98,7 @@ def build() -> AgentSpec:
         system_prompt=SYSTEM_PROMPT,
         tools=TOOLS,
         greeting=GREETING,
+        on_startup=sweep_on_boot,
         guards=GuardSpec(
             input_check=injection_check,
             input_replacement=INPUT_REFUSAL,

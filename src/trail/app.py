@@ -157,6 +157,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "TRAIL_IDENTITY_SECRET is empty: no request can authenticate, "
                 "every thread endpoint will answer 401"
             )
+
+        # Whatever the example has to do before serving anything. For the
+        # banking agent that is the restart sweep: an intent left in SUBMITTED
+        # means a previous process called the bank and died before the answer
+        # arrived, it has no way out on its own, and `reconcile` only accepts
+        # UNKNOWN. Running it here — once, at boot, with no principal — is what
+        # makes "the container restarted mid-payment" recoverable rather than a
+        # stranded customer. What it *is* belongs to the example; that it runs
+        # belongs here.
+        for line in spec.on_startup() if spec.on_startup else ():
+            logger.warning("%s: %s", spec.name, line)
+
         yield
 
 

@@ -38,7 +38,8 @@ SCHEMA = Path(__file__).resolve().parents[2] / "db" / "schema.sql"
 
 _COLUMNS = (
     "id, customer_id, session_id, context, action, state, created_at, "
-    "confirmation_id, confirmed_at, confirmed_by, receipt, reason"
+    "confirmation_id, confirmation_issued_at, action_digest, "
+    "confirmed_at, confirmed_by, receipt, reason"
 )
 
 
@@ -51,6 +52,8 @@ def _to_intent(row: Mapping[str, Any]) -> Intent:
         state=row["state"],
         created_at=row["created_at"],
         confirmation_id=row["confirmation_id"],
+        confirmation_issued_at=row["confirmation_issued_at"],
+        action_digest=row["action_digest"],
         confirmed_at=row["confirmed_at"],
         confirmed_by=row["confirmed_by"],
         receipt=row["receipt"],
@@ -116,14 +119,16 @@ class PgStore:
                 """
                 INSERT INTO intents (
                     id, customer_id, session_id, context, action, state,
-                    created_at, confirmation_id, confirmed_at, confirmed_by,
-                    receipt, reason
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    created_at, confirmation_id, confirmation_issued_at,
+                    action_digest, confirmed_at, confirmed_by, receipt, reason
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (id) DO UPDATE SET
                     context         = EXCLUDED.context,
                     action          = EXCLUDED.action,
                     state           = EXCLUDED.state,
                     confirmation_id = EXCLUDED.confirmation_id,
+                    confirmation_issued_at = EXCLUDED.confirmation_issued_at,
+                    action_digest   = EXCLUDED.action_digest,
                     confirmed_at    = EXCLUDED.confirmed_at,
                     confirmed_by    = EXCLUDED.confirmed_by,
                     receipt         = EXCLUDED.receipt,
@@ -138,6 +143,8 @@ class PgStore:
                     intent.state,
                     intent.created_at,
                     intent.confirmation_id,
+                    intent.confirmation_issued_at,
+                    intent.action_digest,
                     intent.confirmed_at,
                     intent.confirmed_by,
                     None if intent.receipt is None else Jsonb(intent.receipt),
