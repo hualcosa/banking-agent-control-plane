@@ -17,6 +17,10 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.integration.conftest import INTEGRATION_CUSTOMER
+from trail.identity import HEADER as IDENTITY_HEADER
+from trail.identity import sign
+
 pytestmark = pytest.mark.integration
 
 
@@ -198,3 +202,33 @@ def test_an_empty_message_is_rejected(agent_client: httpx.Client) -> None:
         f"/threads/{thread['thread_id']}/turns", json={"message": ""}
     )
     assert response.status_code == 422
+
+
+def test_a_thread_is_invisible_to_every_other_customer(
+    agent_client: httpx.Client, identity_secret: str
+) -> None:
+    """Scoping, against the real store rather than the in-memory one.
+
+    The unit tier proves the rule; this proves the backend keeps it — the
+    Postgres store is a different implementation of the same index, and a
+    filter it declined to apply would be a leak no fast test could see.
+
+    Everything about the intruder's request is legitimate: a correctly signed
+    header for a customer the service accepts, and a thread id they simply do
+    not own. It answers exactly as it does for an id nobody owns.
+    """
+    other = {IDENTITY_HEADER: sign(f"{INTEGRATION_CUSTOMER}_outro", identity_secret)}
+    thread = open_thread(agent_client)
+    ask(agent_client, thread["thread_id"], "qual é o meu saldo?")
+
+    borrowed = agent_client.get(f"/threads/{thread['thread_id']}", headers=other)
+    invented = agent_client.get(
+        "/threads/00000000-0000-0000-0000-000000000000", headers=other
+    )
+    listed = agent_client.get("/threads", headers=other).json()["threads"]
+    mine = agent_client.get(f"/threads/{thread['thread_id']}").json()
+
+    assert borrowed.status_code == invented.status_code == 404
+    assert borrowed.json() == invented.json()
+    assert thread["thread_id"] not in [t["thread_id"] for t in listed]
+    assert mine["messages"], "the owner still reads their own conversation"

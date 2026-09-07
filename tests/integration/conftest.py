@@ -22,6 +22,8 @@ import httpx
 import pytest
 
 from trail.config import get_settings
+from trail.identity import HEADER as IDENTITY_HEADER
+from trail.identity import sign
 
 HEALTH_TIMEOUT_SECONDS = 3.0
 
@@ -55,9 +57,37 @@ def live_agent(agent_base_url: str) -> str:
     return agent_base_url
 
 
+#: The customer this tier acts as. Any id will do — the stack signs whatever
+#: the shared secret is given — but a fixed one makes a thread created by one
+#: test readable by the next, which is what the persistence assertions need.
+INTEGRATION_CUSTOMER = "cust_integration"
+
+
+@pytest.fixture(scope="session")
+def identity_secret() -> str:
+    """The secret the running stack verifies against.
+
+    Every route but ``/healthz`` requires a signed identity, so a client
+    without one exercises nothing but the 401 path. Missing secret is a skip
+    with a reason, like a missing stack: the tier cannot be run, and a red test
+    that means "you did not configure this" teaches a reviewer to ignore red.
+    """
+    secret = get_settings().identity_secret.get_secret_value()
+    if not secret:
+        pytest.skip(
+            "TRAIL_IDENTITY_SECRET is empty, so every request answers 401. "
+            "Set it in .env to the value the stack runs with."
+        )
+    return secret
+
+
 @pytest.fixture
-def agent_client(live_agent: str) -> Iterator[httpx.Client]:
-    with httpx.Client(base_url=live_agent, timeout=TURN_TIMEOUT_SECONDS) as client:
+def agent_client(live_agent: str, identity_secret: str) -> Iterator[httpx.Client]:
+    with httpx.Client(
+        base_url=live_agent,
+        timeout=TURN_TIMEOUT_SECONDS,
+        headers={IDENTITY_HEADER: sign(INTEGRATION_CUSTOMER, identity_secret)},
+    ) as client:
         yield client
 
 
