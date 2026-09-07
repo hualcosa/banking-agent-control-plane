@@ -20,8 +20,8 @@ WhatsApp / voice / web            ← channels are adapters; text first
 <p align="center">
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-7c3aed?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-runtime-0e7490?style=flat-square&logo=fastapi&logoColor=white">
-  <img alt="384 unit tests" src="https://img.shields.io/badge/unit_tests-384-0e7490?style=flat-square">
-  <img alt="coverage gate 90%" src="https://img.shields.io/badge/coverage_gate-90%25-7c3aed?style=flat-square">
+  <img alt="410 unit tests" src="https://img.shields.io/badge/unit_tests-410-0e7490?style=flat-square">
+  <img alt="coverage 97%" src="https://img.shields.io/badge/coverage-97%25%20(gate%2090%25)-7c3aed?style=flat-square">
   <img alt="invariant matrix 5 by 11 at N=100" src="https://img.shields.io/badge/matrix-5%C3%9711%20%C3%97%20N%3D100-0e7490?style=flat-square">
 </p>
 
@@ -84,6 +84,13 @@ app, and an operator running the runbook at 3am is not in the customer's chat th
 the one that stays session-bound, and that asymmetry is the point — raising assurance and asking the
 bank what it did are safe from elsewhere; agreeing to move money is not.
 
+The one exception runs in a single direction: an intent **proposed by voice** may be confirmed, and
+explained, by the same customer from another channel. Reading a value and a recipient back over a
+phone line and accepting a spoken "sim" is the weakest confirmation this system could offer — a
+misheard yes on a misheard amount compound — so the channel that cannot confirm safely hands off to
+one that can, and the handoff is written to the ledger. A text-proposed intent still cannot be
+confirmed from another text session.
+
 **Restarting mid-payment.** `execution_request` is written before the bank is called and the receipt
 after it, so a process that dies between them leaves an intent in `SUBMITTED` with no way out —
 `reconcile` only accepts `UNKNOWN`. `ControlPlane.sweep()` runs once at boot (through the
@@ -105,8 +112,8 @@ by `reconcile` (ask the bank what it did) — never by paying again.
 | amount > R$ 1.000, or risk `high`, and session assurance < `strong` | `REQUIRE_STEP_UP_AUTH` | `pix_step_up` |
 | capability requires confirmation (every PIX) | `REQUIRE_CONFIRMATION` | `capability_requires_confirmation` |
 
-Risk is mocked as three signals — `new_recipient`, `unusual_amount` (> R$ 500), `untrusted_device`
-— with fixed weights. The numbers are in `policy.py`, not in the prompt, and changing one is a code
+Risk is mocked as four signals — `new_recipient`, `unusual_amount` (> R$ 500), `untrusted_device`,
+and `low_stt_confidence` when a transcriber was involved and was unsure — with fixed weights. The numbers are in `policy.py`, not in the prompt, and changing one is a code
 review rather than a prompt edit.
 
 The second row is the only regulator-fixed one: Resolução BCB nº 142/2021. It reads the hour on a
@@ -119,7 +126,8 @@ instead of only between 20h and 06h.
 ### What the tests prove
 
 `tests/unit/test_control_plane.py` · `test_banking_agent.py` · `test_policy.py` · `test_recovery.py`
-· `test_crash.py` · `test_plane_store.py` · `test_invariants.py`, plus `tests/integration/test_pgstore.py`.
+· `test_crash.py` · `test_plane_store.py` · `test_voice.py` · `test_invariants.py`, plus
+`tests/integration/test_pgstore.py`.
 
 * Proposing moves nothing. Confirming moves money exactly once — a model that calls `confirm_pix`
   twice in one turn produces one payment.
@@ -141,6 +149,12 @@ instead of only between 20h and 06h.
   401 and never reaches the agent — with one message for every failure, so the response is not an
   oracle. Two customers are isolated end to end, and the customer the plane acts for came from
   `configurable`, never from the tools module.
+* A transcript the recogniser is unsure of never moves money: below 0.55 the voice adapter refuses
+  to propose at all — a transcript nobody can read is not a quiet instruction — and below 0.85 it
+  raises risk rather than deciding. Every magnitude collapse ("trezentos" → "treze") and every
+  misheard recipient ("Renata" → "Renato") in the table is asserted to move nothing, and a clean
+  transcript is asserted to still go through, without which the table would only prove that low
+  confidence blocks things.
 * `explain(ctx, intent_id)` returns the persisted chain: request → interpreted → resolution →
   canonical_action → risk → policy → confirmation → authorization → execution_request →
   backend_response — and returns it only to the customer **and** thread that opened it. The
@@ -221,11 +235,12 @@ the agent is the thing that is down. `docs/runbook.md` is the procedure they bel
 
 ### What V0 leaves out, on purpose
 
-A risk engine, Open Finance, a real PIX rail, voice, an authenticated step-up factor (the CLI
-command *is* the factor today), scoping the thread endpoints per customer, and any check that the
-bank's receipt matches the action that was confirmed. Each is either a `# ponytail:` comment naming
+A risk engine, Open Finance, a real PIX rail, real speech recognition (the voice adapter is a
+hand-written table of pt-BR confusions and says so), an authenticated step-up factor (the CLI
+command *is* the factor today), and any check that the bank's receipt matches the action that was
+confirmed. Each is either a `# ponytail:` comment naming
 the ceiling and the upgrade path — `grep -rn "ponytail:" src examples` lists them — or a row in
-`docs/threat-model.md`, which is the honest list: 22 adversaries, 18 with a named test, 4 still open.
+`docs/threat-model.md`, which is the honest list: 23 adversaries, 20 with a named test, 3 still open.
 
 Two things that used to be on this list are not any more. **Identity** is no longer a constant in
 the tools module: the channel signs it, `src/trail/identity.py` verifies it, and a request that
@@ -558,7 +573,7 @@ Each of these was argued and declined.
 | **A pluggable rule engine** | See §5. TRAIL owns when a check runs and what happens when it fails. Rules that satisfy every domain constrain none of them. |
 | **A hand-written trace table** | Per-call tokens, cost and latency live in Langfuse. A local table duplicating them would be a second source of truth for the same numbers — the one this repository can least afford to have disagree with itself. |
 | **Token streaming, for now** | The `messages` channel is already requested from the graph, so the wire contract does not change when it lands. What streams today is the pipeline, which is the honest thing to show for an agent whose answer is assembled from tool results. |
-| A full auth stack and multi-tenancy | Still declined, but the line moved: the banking example needs to know *whose* money it is, so a signed channel header now authenticates every request (`src/trail/identity.py`). What is deliberately absent is a token format — no expiry, no audience, no rotation — and per-customer scoping of the thread endpoints. Both belong with a real identity provider, which is milestone 4's Cognito JWT verified at the same one line of plumbing. |
+| A full auth stack and multi-tenancy | Still declined, but the line moved: the banking example needs to know *whose* money it is, so a signed channel header now authenticates every request (`src/trail/identity.py`). Threads are scoped to the customer who opened them, and someone else's thread is a 404 byte-identical to one that never existed. What is deliberately absent is a token format — no expiry, no audience, no rotation — and that belongs with a real identity provider, which is milestone 4's Cognito JWT verified at the same one line of plumbing. |
 | Database migrations | Four tables of this repository's own. `make clean` drops the volume and the init hook applies the schema again — and because initdb only runs on an empty volume, `PgStore` applies the schema on startup too. |
 | An operator console | The `ui` service is a demo of one conversation, not a workplace. No queue, no assignment, no sign-off, no auth. Those belong to a product, and the specialist review step they would serve is the one thing a person should do. |
 | An eval dashboard | `make eval` renders the metrics and the failure taxonomy legibly in a terminal, with no build step. Charting a run nobody has published is the most visible and least informative thing a repository can contain. |
@@ -580,6 +595,7 @@ db/schema.sql                 Four tables, and §4 says why those four
 docs/threat-model.md          22 adversaries × invariant × the test that proves it, or the gap
 docs/execution-plan.md        The blueprint: tasks, sessions, gates — and what is done
 docs/runbook.md               What a person does with an intent in UNKNOWN
+docs/adr/                     The decisions that had an alternative, each pointing at its evidence
 
 src/control_plane/            The boundary. No framework, no bank SDK — see "The control plane" above
   actions.py                  Context, ProposedPix → CreatePix, the capability registry
@@ -616,7 +632,8 @@ src/trail/
     report.py                 The terminal scorecard: violations first, then numbers
 
 examples/banking/             The default agent. Seven tools, each a call into the control plane
-  agent.py                    The AgentSpec: a relay prompt, the tools, injection + secret-leak gates
+  agent.py                    The AgentSpec: a relay prompt, the tools, injection + secret-leak gates, the boot sweep
+  voice.py                    The voice channel: a simulated transcript, a confidence, and nothing else
   tools.py                    propose_pix · confirm_pix · … — JSON in, JSON out, no bank access
   golden.py                   Sixteen cases (banking-v3), five adversarial, two zero-tolerance
 examples/trail_guide/         The agent that explains TRAIL. Two tools, three checks

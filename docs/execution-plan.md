@@ -52,41 +52,68 @@ Dois achados da exploração mudaram o desenho original:
 
 ## Tarefas (esforço: S<1h · M≈meia sessão · L≈sessão)
 
-| # | Tarefa | Pré-req | Esf | Arquivos | Verificação |
-|---|---|---|---|---|---|
-| T1 | `docs/threat-model.md`: adversário × invariante × teste (incluir IDOR do explain, replay de confirmação, injeção) | — | M | novo | toda linha cita um id de teste |
-| T2 | CI: `pytest -m unit --cov` em PR | — | S | `.github/workflows/ci.yml` | um PR vermelho |
-| T3 | `explain(ctx, intent_id)` + ownership | — | S | `plane.py`, `tools.py`, testes | `OTHER_SESSION` recebe `[]` |
-| T4 | Apagar `approve_step_up` + regra 4 do prompt + teste | — | S | `tools.py`, `agent.py`, `test_banking_agent.py`, `golden.py` | nenhuma tool aprova nada |
-| T5 | Regras BACEN (noturna 20h–06h + limite/tx), clock injetado | — | M | `policy.py`, `tests/unit/test_policy.py` novo | testes com relógio fixo |
-| T6a | `db/schema.sql`: `intents`, `ledger_events` | — | S | `db/schema.sql` | aplica 2× limpo |
-| T6b | `Store` protocol + `MemoryStore`; `ControlPlane(store=…)` | — | M | `control_plane/store.py` novo, `state.py`, `plane.py` | 21 testes existentes passam **sem edição** |
-| T6c | `PgStore` (pool síncrono, aplica schema no startup) | T6a,T6b | M | `control_plane/pgstore.py` novo, `pyproject.toml` (omit) | `make test` ≥90% E `make test-integration` |
-| T7 | Sweep de restart `SUBMITTED→UNKNOWN` (aresta existente) | T6b | M | `plane.py`, lifespan | kill no meio do PIX → restart → sweep → reconcile → 1 débito |
-| T8 | TTL de confirmação + digest HMAC da ação | T6b | M | `state.py`, `plane.py` | expirada→CANCELLED; digest divergente→DENY |
-| T9 | Identidade HMAC: header → `app.py` → `configurable` → `context_for` | — | M | `app.py`, `turns.py`, `tools.py`, `cli.py`, testes | header forjado→401; 2 clientes isolados |
-| T10 | `trail step-up <intent_id>` no CLI | T6c,T4 | M | `cli.py`, runbook | step-up completa sem tocar o agente |
-| T11 | `Case.turn_checks` + loop no runner | — | S | `evals/cases.py`, `evals/runner.py` | suite atual verde + 1 caso multi-turno |
-| T12 | Seam de crash: `FaultyBank(MockBank)` com `crash_at` | T6b | S | `tests/fakes.py` | levanta entre débito e recibo |
-| T13 | Matriz: 5 invariantes × ~6 cenários × N≥100, seeded | T12,T7,T8 | L | `tests/unit/test_invariants.py` novo | `pytest -m matrix` verde, <60s |
-| T14 | Renderer + `make matrix` | T13 | S | `Makefile` | tabela impressa, exit≠0 em célula vermelha |
-| T15 | Golden set adversarial (+5 casos) | T11,T4,T9 | M | `golden.py` | ambíguo, correção, injeção, ação não suportada, saída malformada |
-| T16 | Matar a race do eval (banco por customer / plane por thread) | T9 | S | `bank.py` ou `tools.py` | 3 `make eval` seguidos, mesmo resultado |
-| T17 | IaC (CDK TS): VPC (subnets privadas em sae1-az1..3, NAT, endpoints), RDS, ECR, Cognito, AgentCore Runtime (VPC mode + JWT authorizer + header allowlist) — copiando constructs do template FAST | — | L | `infra-cdk/` novo | `cdk synth` limpo |
-| T17b | Contrato do Runtime: `/invocations` (embrulha `run_turn`, SSE) + `/ping` no app; build arm64; `opentelemetry-instrument` no CMD | — | M | `app.py`, `Dockerfile` | container local responde ao contrato via curl |
-| T17c | UI deployada fala com o Runtime: adotar `agentcore-client` (parser LangGraph pronto) + login Cognito | T17 | M | `ui/` | chat streaming em prod via JWT |
-| T18 | Provider seam `TRAIL_LLM_PROVIDER` + `langchain-aws` | — | S | `agent.py:85`, `config.py` | `bedrock_converse:` monta sem rede |
-| T19 | Runbook + `trail intents`/`trail reconcile` | T6c | M | `cli.py`, `docs/runbook.md` | humano resolve `UNKNOWN` só com o doc |
-| T20 | ADR residência sa-east-1 | T18 | S | `docs/adr/` | cita latência medida |
-| T21 | Deploy + `UNKNOWN` forçado em prod (PIX `,13`) | T17,T19,T7 | L | — | runbook executado em prod |
-| T22 | `git tag before-voice` | T21 | S | — | baseline do diff |
-| T23 | Voz simulada: `stt_confidence` no `Context` + sinal de risco + tabela de transcrições sintéticas ("trezentos"→"treze", "Renata"→"Renato") | T22 | M | `actions.py`, `policy.py`, `voice.py` novo | confiança baixa → step-up/more-info; colapso de magnitude nunca executa |
-| T24 | Confirmação cross-channel (já paga pela decisão de ownership do T10) | T8,T9 | S | `plane.py:451` | voz propõe → texto confirma → 1 débito |
-| T25 | `git diff --stat before-voice -- src/control_plane/` + 1 chamada STT real pra provar o adaptador | T23,T24 | S | — | o número (~6 linhas esperadas) |
-| T26 | Benchmark extração (3 modelos × golden set congelado) | T15 congelado | M | `Makefile` loop sobre `TRAIL_MODEL` | mesma `golden_set_version` |
-| T27 | Benchmark STT pt-BR (valores e nomes) | T23 | M | `bench/` | WER em valores/nomes |
-| T28 | Bedrock vs API externa + ADR observabilidade (Langfuse/LangSmith/AgentCore) | T18,T26 | M | `docs/adr/` | tabela latência/custo/residência |
-| T29 | Post final + diagrama + índice de ADRs | tudo | L | `docs/` | cada seta → ADR → número |
+> **Estado das tarefas — nota acrescentada depois de S1–S5 e do primeiro commit
+> de voz.** Este plano é documento histórico: o raciocínio abaixo é o de
+> 2026-08-31 e fica como está, inclusive onde a execução discordou dele. A
+> coluna **Estado** é a única coisa acrescentada, e diz apenas *feito* ou *não
+> começou* — o que cada tarefa entregou está no `ROADMAP.md` (marco por marco,
+> com o gate) e em `docs/threat-model.md` (linha por linha, com o teste).
+>
+> **Feito (S1–S5):** T1 · T2 · T3 · T4 · T5 · T6a · T6b · T6c · T7 · T8 · T9 ·
+> T10 · T11 · T12 · T13 · T14 · T15 · T16 · T18 · T19 · T22 · T23 · T24.
+> **Não começou:** T17 · T17b · T17c (o marco 4 inteiro: CDK, contrato do
+> Runtime, UI deployada) · T20 · T21 · T25 · T26 · T27 · T28 · T29.
+>
+> Três notas onde o plano e a execução divergiram, e a divergência é informação:
+>
+> * **T19 saiu antes da hora, e por um bom motivo.** Runbook e `trail
+>   intents`/`trail reconcile` são itens do marco 4, mas o step-up out-of-band do
+>   T10 precisava dos mesmos comandos, então saíram juntos em S5. O marco 4
+>   continua não começado: o runbook nunca foi executado contra produção.
+> * **T6c está feito e ainda não está ligado.** O `PgStore` existe, é testado em
+>   integração e é o que o CLI abre; o processo que serve o chat ainda constrói
+>   `ControlPlane()` sobre `MemoryStore` (`examples/banking/tools.py:56`). A
+>   durabilidade está provada no store, não no serviço.
+> * **T13 rendeu uma armadilha que o plano não previu.** Uma célula da matriz
+>   pode passar de `100/100` a "não se aplica" sem ficar vermelha — foi o que
+>   aconteceu numa rodada de mutação que desligou o sweep. `MUST_APPLY` fixa
+>   quais invariantes cada cenário tem de alcançar de fato.
+
+| # | Tarefa | Pré-req | Esf | Arquivos | Verificação | Estado |
+|---|---|---|---|---|---|---|
+| T1 | `docs/threat-model.md`: adversário × invariante × teste (incluir IDOR do explain, replay de confirmação, injeção) | — | M | novo | toda linha cita um id de teste | **feito** |
+| T2 | CI: `pytest -m unit --cov` em PR | — | S | `.github/workflows/ci.yml` | um PR vermelho | **feito** |
+| T3 | `explain(ctx, intent_id)` + ownership | — | S | `plane.py`, `tools.py`, testes | `OTHER_SESSION` recebe `[]` | **feito** |
+| T4 | Apagar `approve_step_up` + regra 4 do prompt + teste | — | S | `tools.py`, `agent.py`, `test_banking_agent.py`, `golden.py` | nenhuma tool aprova nada | **feito** |
+| T5 | Regras BACEN (noturna 20h–06h + limite/tx), clock injetado | — | M | `policy.py`, `tests/unit/test_policy.py` novo | testes com relógio fixo | **feito** |
+| T6a | `db/schema.sql`: `intents`, `ledger_events` | — | S | `db/schema.sql` | aplica 2× limpo | **feito** |
+| T6b | `Store` protocol + `MemoryStore`; `ControlPlane(store=…)` | — | M | `control_plane/store.py` novo, `state.py`, `plane.py` | 21 testes existentes passam **sem edição** | **feito** |
+| T6c | `PgStore` (pool síncrono, aplica schema no startup) | T6a,T6b | M | `control_plane/pgstore.py` novo, `pyproject.toml` (omit) | `make test` ≥90% E `make test-integration` | **feito** |
+| T7 | Sweep de restart `SUBMITTED→UNKNOWN` (aresta existente) | T6b | M | `plane.py`, lifespan | kill no meio do PIX → restart → sweep → reconcile → 1 débito | **feito** |
+| T8 | TTL de confirmação + digest HMAC da ação | T6b | M | `state.py`, `plane.py` | expirada→CANCELLED; digest divergente→DENY | **feito** |
+| T9 | Identidade HMAC: header → `app.py` → `configurable` → `context_for` | — | M | `app.py`, `turns.py`, `tools.py`, `cli.py`, testes | header forjado→401; 2 clientes isolados | **feito** |
+| T10 | `trail step-up <intent_id>` no CLI | T6c,T4 | M | `cli.py`, runbook | step-up completa sem tocar o agente | **feito** |
+| T11 | `Case.turn_checks` + loop no runner | — | S | `evals/cases.py`, `evals/runner.py` | suite atual verde + 1 caso multi-turno | **feito** |
+| T12 | Seam de crash: `FaultyBank(MockBank)` com `crash_at` | T6b | S | `tests/fakes.py` | levanta entre débito e recibo | **feito** |
+| T13 | Matriz: 5 invariantes × ~6 cenários × N≥100, seeded | T12,T7,T8 | L | `tests/unit/test_invariants.py` novo | `pytest -m matrix` verde, <60s | **feito** |
+| T14 | Renderer + `make matrix` | T13 | S | `Makefile` | tabela impressa, exit≠0 em célula vermelha | **feito** |
+| T15 | Golden set adversarial (+5 casos) | T11,T4,T9 | M | `golden.py` | ambíguo, correção, injeção, ação não suportada, saída malformada | **feito** |
+| T16 | Matar a race do eval (banco por customer / plane por thread) | T9 | S | `bank.py` ou `tools.py` | 3 `make eval` seguidos, mesmo resultado | **feito** |
+| T17 | IaC (CDK TS): VPC (subnets privadas em sae1-az1..3, NAT, endpoints), RDS, ECR, Cognito, AgentCore Runtime (VPC mode + JWT authorizer + header allowlist) — copiando constructs do template FAST | — | L | `infra-cdk/` novo | `cdk synth` limpo | não começou |
+| T17b | Contrato do Runtime: `/invocations` (embrulha `run_turn`, SSE) + `/ping` no app; build arm64; `opentelemetry-instrument` no CMD | — | M | `app.py`, `Dockerfile` | container local responde ao contrato via curl | não começou |
+| T17c | UI deployada fala com o Runtime: adotar `agentcore-client` (parser LangGraph pronto) + login Cognito | T17 | M | `ui/` | chat streaming em prod via JWT | não começou |
+| T18 | Provider seam `TRAIL_LLM_PROVIDER` + `langchain-aws` | — | S | `agent.py:85`, `config.py` | `bedrock_converse:` monta sem rede | **feito** |
+| T19 | Runbook + `trail intents`/`trail reconcile` | T6c | M | `cli.py`, `docs/runbook.md` | humano resolve `UNKNOWN` só com o doc | **feito** |
+| T20 | ADR residência sa-east-1 | T18 | S | `docs/adr/` | cita latência medida | não começou |
+| T21 | Deploy + `UNKNOWN` forçado em prod (PIX `,13`) | T17,T19,T7 | L | — | runbook executado em prod | não começou |
+| T22 | `git tag before-voice` | T21 | S | — | baseline do diff | **feito** |
+| T23 | Voz simulada: `stt_confidence` no `Context` + sinal de risco + tabela de transcrições sintéticas ("trezentos"→"treze", "Renata"→"Renato") | T22 | M | `actions.py`, `policy.py`, `voice.py` novo | confiança baixa → step-up/more-info; colapso de magnitude nunca executa | **feito** |
+| T24 | Confirmação cross-channel (já paga pela decisão de ownership do T10) | T8,T9 | S | `plane.py:451` | voz propõe → texto confirma → 1 débito | **feito** |
+| T25 | `git diff --stat before-voice -- src/control_plane/` + 1 chamada STT real pra provar o adaptador | T23,T24 | S | — | o número (~6 linhas esperadas) | não começou |
+| T26 | Benchmark extração (3 modelos × golden set congelado) | T15 congelado | M | `Makefile` loop sobre `TRAIL_MODEL` | mesma `golden_set_version` | não começou |
+| T27 | Benchmark STT pt-BR (valores e nomes) | T23 | M | `bench/` | WER em valores/nomes | não começou |
+| T28 | Bedrock vs API externa + ADR observabilidade (Langfuse/LangSmith/AgentCore) | T18,T26 | M | `docs/adr/` | tabela latência/custo/residência | não começou |
+| T29 | Post final + diagrama + índice de ADRs | tudo | L | `docs/` | cada seta → ADR → número | não começou |
 
 ## Caminho crítico (confirmado pelos dois planejadores)
 

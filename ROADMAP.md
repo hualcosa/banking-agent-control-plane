@@ -13,15 +13,15 @@ O gateway **executa**. O LLM nunca encosta no dinheiro diretamente.
 linguagem natural → LLM → ação tipada → regras determinísticas → banco
 ```
 
-## Onde estamos (depois de S1–S5, 17 commits desde `f043ea3`)
+## Onde estamos (depois de S1–S5 e do primeiro commit de voz, 21 commits desde `f043ea3`)
 
 | Marco | Estado | Evidência |
 |---|---|---|
-| 1 — ameaças e metas | **feito** | `docs/threat-model.md`, revisado em S5: 22 adversários, 18 com teste nomeado, 4 lacunas honestas |
-| 2 — endurecer o V1 | **feito** | `make lint && make test` (384 testes unitários, gate de 90%) + `make test-integration` (22 testes) |
+| 1 — ameaças e metas | **feito** | `docs/threat-model.md`, revisado em S5: 23 adversários, 19 com teste nomeado, 4 lacunas honestas |
+| 2 — endurecer o V1 | **feito** | `make lint && make test` (410 testes unitários, gate de 90%) + `make test-integration` (22 testes) |
 | 3 — evidência de falha | **feito** | `make matrix`: 5 invariantes × 11 cenários × N=100, sem LLM |
 | 4 — AWS + operação | **não começou** | o `docs/runbook.md` já existe (escrito em S5, junto do `trail intents`/`trail reconcile`), mas nunca foi executado contra produção porque não há produção |
-| 5 — voz | **em andamento agora** | — |
+| 5 — voz | **em andamento agora** | primeiro commit dentro; `git diff --stat before-voice -- src/control_plane/` = 63 inserções, 5 remoções em 3 arquivos — e são dois números, não um (ver o marco) |
 | 6 — benchmarks e decisão final | não começou | — |
 
 O `src/control_plane/` tem ações tipadas, máquina de estados, política (com duas
@@ -81,10 +81,12 @@ palavra. Sem meta de latência, o marco 4 não sabe que infra escolher.
 **Terminou quando:** existe `docs/threat-model.md` com tabela adversário → invariante → teste que vai provar.
 
 **Fechado.** O arquivo existe e é falsificável em um comando (o `grep` no fim
-dele). Revisado ao fim de S5: 22 linhas, 18 cobertas, 4 lacunas — A2 (nada
+dele). Revisado ao fim de S5: 23 linhas, 19 cobertas, 4 lacunas — A2 (nada
 screena saída de tool), A11 (fabricação no canal, medida com LLM), A14 (o recibo
 do banco nunca é conferido contra a ação confirmada) e A22 (endpoints de thread
-autenticam mas não escopam por cliente). Nenhuma tem tarefa no plano.
+autenticam mas não escopam por cliente). Nenhuma tem tarefa no plano. A linha
+A23 (transcrição errada tratada como instrução) entrou com a voz e já nasceu
+coberta.
 
 ---
 
@@ -244,7 +246,7 @@ forçando um `UNKNOWN` em produção.
 
 ---
 
-## Marco 5 — Teste de estresse com voz (com prazo fechado)
+## Marco 5 — Teste de estresse com voz · **EM ANDAMENTO**
 
 **Pergunta:** o control plane é mesmo independente de canal?
 
@@ -269,9 +271,43 @@ o que a voz revelou que faltava.
 **Terminou quando:** um PIX por voz passa pelo mesmo `propose → confirm → execute`
 e o diff no control plane está medido.
 
+**Onde está.** O primeiro commit do marco entrou (`examples/banking/voice.py`,
+`tests/unit/test_voice.py`) e o número já existe, contra a tag `before-voice`:
+
+```text
+src/control_plane/actions.py |  7 ++
+src/control_plane/policy.py  | 14 ++
+src/control_plane/plane.py   | 47 ++++++-----
+3 arquivos, 63 inserções, 5 remoções
+```
+
+Lido com honestidade são **dois** números, e essa é a história:
+
+- **21 linhas são voz de fato** — `Context.stt_confidence` e o sinal de risco
+  `low_stt_confidence` que o lê. O campo tem de existir porque "não tenho
+  certeza de ter ouvido isso" não é um fato que canal de texto nenhum saiba
+  expressar, e é `None` em canal de texto em vez de 1.0: "certamente digitado" e
+  "perfeitamente ouvido" são fatos diferentes. O sinal vive no risco, não como
+  regra própria — incerteza sobre o que foi dito muda o cuidado com a ação, não
+  escolhe a ação. **A abstração aguentou.**
+- **As outras 42 são confirmação cross-channel**, que o plano de execução já
+  atribui à decisão de ownership do marco 2, não à voz. É ali que a conta chega:
+  um intent proposto por voz aceita confirmação (e `explain`) do mesmo cliente
+  por outro canal, porque ler valor e destinatário por telefone e aceitar um
+  "sim" falado é a confirmação mais fraca que este sistema conseguiria oferecer.
+
+**Falta:** uma chamada real de STT para o diff não ser infalsificável (T25,
+armadilha 6), e a decisão sobre o que o post reporta. O adaptador de hoje é uma
+**simulação** e diz isso no próprio docstring: `TRANSCRIPTS` é uma tabela escrita
+à mão das duas classes de confusão que o reconhecimento pt-BR faz com dinheiro e
+nomes — colapso de magnitude ("trezentos" → "treze", erro de vinte vezes que o
+cliente não pega numa leitura de volta) e confusão de destinatário ("Renata" →
+"Renato", um fonema, duas pessoas). Uma tabela não produz taxa de erro; isso é o
+benchmark T27, contra um reconhecedor de verdade.
+
 ---
 
-## Marco 6 — Benchmarks e a decisão final
+## Marco 6 — Benchmarks e a decisão final · **NÃO COMEÇOU**
 
 **Pergunta:** o que eu realmente colocaria em produção?
 
@@ -359,14 +395,20 @@ Perde a voz como história própria — o diff vira uma linha do post final.
 ## Sequência resumida
 
 ```text
-1. ameaças + metas      (doc)
+1. ameaças + metas      (doc)                                  FEITO   S1
 2. endurecer V1         (Postgres, identidade, step-up real, regras BACEN)
-3. evidência de falha   (matriz invariante × cenário)
-4. AWS + runbook        (deploy + ADR de residência)
-5. voz                  (diff no control plane como métrica)
-6. benchmarks + final   (3 medições, 1 recomendação)
+                                                               FEITO   S1–S4
+3. evidência de falha   (matriz invariante × cenário)          FEITO   S3–S5
+4. AWS + runbook        (deploy + ADR de residência)           runbook feito, deploy não começou
+5. voz                  (diff no control plane como métrica)   EM ANDAMENTO
+6. benchmarks + final   (3 medições, 1 recomendação)           não começou
 ```
 
-Próximo passo quando voltar: fechar o marco 1 — `docs/threat-model.md`, CI,
-regras BACEN — e então o seam de storage (marco 2). O plano de execução está em
-`docs/execution-plan.md`.
+**Próximo passo quando voltar:** terminar o marco 5 (uma chamada real de STT,
+para o diff não ser infalsificável) e então o marco 4 inteiro, que é o único
+grande bloco intocado: `infra-cdk/`, contrato `/invocations` + `/ping`, imagem
+arm64, deploy, e o `UNKNOWN` forçado em produção. Duas dívidas pequenas ficam no
+caminho e valem ser pagas antes do deploy: ligar o serviço ao `PgStore` (hoje só
+o CLI o usa) e escopar os endpoints de thread por cliente (A22 do threat model).
+O plano de execução está em `docs/execution-plan.md`; as decisões já tomadas,
+com evidência, em `docs/adr/`.
