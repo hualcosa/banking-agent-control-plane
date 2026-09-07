@@ -20,15 +20,17 @@ WhatsApp / voice / web            ← channels are adapters; text first
 <p align="center">
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-7c3aed?style=flat-square&logo=python&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-runtime-0e7490?style=flat-square&logo=fastapi&logoColor=white">
-  <img alt="293 unit tests" src="https://img.shields.io/badge/unit_tests-293_passing-0e7490?style=flat-square">
-  <img alt="97% coverage" src="https://img.shields.io/badge/coverage-97%25-7c3aed?style=flat-square">
+  <img alt="384 unit tests" src="https://img.shields.io/badge/unit_tests-384-0e7490?style=flat-square">
+  <img alt="coverage gate 90%" src="https://img.shields.io/badge/coverage_gate-90%25-7c3aed?style=flat-square">
+  <img alt="invariant matrix 5 by 11 at N=100" src="https://img.shields.io/badge/matrix-5%C3%9711%20%C3%97%20N%3D100-0e7490?style=flat-square">
 </p>
 
 > **The agent may propose actions. The control plane authorizes and executes them.**
 
-This repository is V0: one customer, one account, three capabilities (`get_balance`,
-`get_card_transactions`, `create_pix`), a mocked bank, in-process state. The *shape* is the
-enterprise one — every boundary that a real deployment needs already exists as a module with a
+This repository is V0: one account per customer, three capabilities (`get_balance`,
+`get_card_transactions`, `create_pix`), a mocked bank. Identity now comes from a signed channel
+header rather than a constant, and the plane's state lives behind a `Store` interface with a
+Postgres implementation. The *shape* is the enterprise one — every boundary that a real deployment needs already exists as a module with a
 narrow interface — and the implementation behind each boundary is the smallest thing that works.
 
 It is built on [TRAIL](#trail--the-runtime-underneath), the traced agent runtime it was forked
@@ -39,15 +41,17 @@ come from there and are described in the second half of this file.
 
 ## The control plane
 
-Everything lives in `src/control_plane/`, five modules, no framework:
+Everything lives in `src/control_plane/`, seven modules, no framework:
 
 | Module | Owns | The one thing to read |
 |---|---|---|
 | `actions.py` | Typed actions, `Context`, capability registry | `ProposedPix` (what the agent may say) vs `CreatePix` (canonical; only the plane builds it) |
-| `policy.py` | Mocked risk signals; ordered policy rules | `evaluate()` — first rule that applies decides; every verdict names its rule |
-| `state.py` | `Intent`, the state machine, the ledger | `TRANSITIONS` — a hop not in the table raises and is recorded |
+| `policy.py` | Mocked risk signals; ordered policy rules, including the BACEN nighttime cap | `evaluate(…, now=…)` — first rule that applies decides; every verdict names its rule, and the clock is injected |
+| `state.py` | `Intent`, the state machine, the ledger event, the confirmation TTL and the action digest | `TRANSITIONS` — a hop not in the table raises and is recorded |
+| `store.py` | The `Store` protocol and `MemoryStore` | `unsettled()` — the question a restart has to ask |
+| `pgstore.py` | `PgStore`: the same protocol over `intents` and `ledger_events` | it applies `db/schema.sql` on startup, because initdb only runs on an empty volume |
 | `bank.py` | The mock bank | `create_pix(idempotency_key=…)` — same key twice, one payment |
-| `plane.py` | `propose` · `step_up` · `confirm` · `cancel` · `reconcile` · `explain` | `_execute()` — the only place the bank is asked to move money |
+| `plane.py` | `propose` · `step_up` · `confirm` · `cancel` · `reconcile` · `sweep` · `explain` | `_execute()` — the only place the bank is asked to move money |
 
 ### The write path
 
@@ -60,10 +64,32 @@ Everything lives in `src/control_plane/`, five modules, no framework:
 "Você vai enviar R$ 300,00 para Renata Silva. Confirma?"
 "sim"
    ↓ agent → confirm_pix(confirmation_id)
-   ↓ plane:  same customer AND same session? → AUTHORIZED → SUBMITTED
+   ↓ plane:  same customer AND same session? within the 5-minute TTL?
+             does the action still hash to the digest the token was issued for?
+                                                        → AUTHORIZED → SUBMITTED
              bank.create_pix(idempotency_key=intent.id) → COMPLETED
 "Feito. R$ 300,00 enviados para Renata Silva."
 ```
+
+Three things guard that one hop, and each answers a different question. **Same principal** — a
+"yes" said in one conversation cannot be spent in another. **TTL** — a five-minute-old consent is
+not a weaker yes, it is not a yes, so the intent is cancelled rather than left waiting for a token
+that will never get younger. **Keyed action digest** (`hmac`, `TRAIL_CONFIRMATION_SECRET`) — consent
+was to one exact object, so if the action no longer hashes to what the token was issued against,
+something rewrote it after the customer agreed, and the only safe answer is refusal.
+
+Step-up and reconciliation are scoped to customer **+ intent** rather than customer + session,
+because both arrive from outside the conversation by definition: an approval comes from the bank's
+app, and an operator running the runbook at 3am is not in the customer's chat thread. `confirm` is
+the one that stays session-bound, and that asymmetry is the point — raising assurance and asking the
+bank what it did are safe from elsewhere; agreeing to move money is not.
+
+**Restarting mid-payment.** `execution_request` is written before the bank is called and the receipt
+after it, so a process that dies between them leaves an intent in `SUBMITTED` with no way out —
+`reconcile` only accepts `UNKNOWN`. `ControlPlane.sweep()` runs once at boot (through the
+`AgentSpec.on_startup` hook), moves those to `UNKNOWN` along an edge the state machine already had,
+and logs the ids for a person. It takes no `Context`, because a process starting up has no
+principal.
 
 The states, all of them: `CREATED → VALIDATED → [AWAITING_STEP_UP →] AWAITING_CONFIRMATION →
 AUTHORIZED → SUBMITTED → COMPLETED`, with `FAILED`, `CANCELLED`, `REVERSED`, `PENDING` and
@@ -75,6 +101,7 @@ by `reconcile` (ask the bank what it did) — never by paying again.
 | Condition | Verdict | Rule |
 |---|---|---|
 | amount > R$ 5.000 | `DENY` | `pix_hard_limit` |
+| amount > R$ 1.000 between 20h and 06h **São Paulo time** | `DENY` | `pix_nighttime_limit` |
 | amount > R$ 1.000, or risk `high`, and session assurance < `strong` | `REQUIRE_STEP_UP_AUTH` | `pix_step_up` |
 | capability requires confirmation (every PIX) | `REQUIRE_CONFIRMATION` | `capability_requires_confirmation` |
 
@@ -82,19 +109,77 @@ Risk is mocked as three signals — `new_recipient`, `unusual_amount` (> R$ 500)
 — with fixed weights. The numbers are in `policy.py`, not in the prompt, and changing one is a code
 review rather than a prompt edit.
 
-### What the tests prove (`tests/unit/test_control_plane.py`, `test_banking_agent.py`)
+The second row is the only regulator-fixed one: Resolução BCB nº 142/2021. It reads the hour on a
+Brazilian clock rather than a UTC one — comparing a UTC hour to a rule written in local time moves
+the window by three hours — and it comes *before* the step-up demand, so a nighttime transfer is
+refused rather than escalated into an authentication the customer could pass. The clock is injected
+into both `evaluate()` and `ControlPlane`, which is what makes the rule testable at a fixed instant
+instead of only between 20h and 06h.
+
+### What the tests prove
+
+`tests/unit/test_control_plane.py` · `test_banking_agent.py` · `test_policy.py` · `test_recovery.py`
+· `test_crash.py` · `test_plane_store.py` · `test_invariants.py`, plus `tests/integration/test_pgstore.py`.
 
 * Proposing moves nothing. Confirming moves money exactly once — a model that calls `confirm_pix`
   twice in one turn produces one payment.
 * A `confirmation_id` is honoured only from the customer **and** the thread that created it. A
   made-up one, or one from another conversation, is `DENY` with nothing moved.
+* A confirmation older than the TTL cancels the intent instead of paying, and cannot be revived by
+  asking again. An action mutated after the token was issued is refused, and the mismatch is written
+  to the ledger rather than swallowed. The digest is **keyed**, not merely hashed — there is a test
+  whose whole job is to tell those two apart.
 * A timeout leaves `UNKNOWN`, a second confirm still pays nothing, `reconcile` finds the receipt.
-* Two contacts named Ana come back as a question. A PIX over the limit is refused by rule name.
+* A bank that dies *after* debiting (`FaultyBank(crash_at="after_pay")`) strands an intent in
+  `SUBMITTED`; a new plane over the same store sweeps it to `UNKNOWN`, reconciles it, and the bank
+  is paid exactly once across the crash and the restart. Its twin, a crash *before* the call, is
+  indistinguishable from storage alone and resolves to `FAILED` — which is why the sweep asks the
+  bank instead of assuming.
+* Two contacts named Ana come back as a question. A PIX over the limit is refused by rule name, and
+  the nighttime cap is read on a Brazilian clock and applied before the step-up demand.
+* Identity is verified at the edge: a request with no `X-Trail-Identity` header, or a forged one, is
+  401 and never reaches the agent — with one message for every failure, so the response is not an
+  oracle. Two customers are isolated end to end, and the customer the plane acts for came from
+  `configurable`, never from the tools module.
 * `explain(ctx, intent_id)` returns the persisted chain: request → interpreted → resolution →
   canonical_action → risk → policy → confirmation → authorization → execution_request →
   backend_response — and returns it only to the customer **and** thread that opened it. The
   trail holds the `confirmation_id`, so an unscoped audit read is a way to borrow a "yes";
   from another conversation the answer is `[]`, the same answer an id that never existed gets.
+* The state survives the process that wrote it: the same suite of ownership, ordering and
+  idempotency claims runs again against `PgStore` in `tests/integration/test_pgstore.py`, where
+  "restart" means a second `ControlPlane` over the same database.
+
+### `make matrix` — five invariants against eleven hazards
+
+The unit suite says the plane *should* hold. The matrix counts how often it does: five invariants
+(no double spend · no unauthorized execution · exactly the confirmed action · ambiguity stops ·
+unknown asks the bank) against eleven scenarios — happy path, repeated confirmation, concurrent
+execution, crash after paying, crash before paying, bank timeout, borrowed token, expired yes,
+mutated action, ambiguous recipient, bank refusal — at **N=100 seeded trials per cell**, in seconds,
+with no model anywhere near it. A failing trial prints the seed that produced it.
+
+Three rules make the number mean something, and each cost a bug to learn:
+
+* **Debits are counted, not inferred.** `MockBank` is idempotent by key, so `len(bank.payments)`
+  would assert the *bank's* guarantee and pass even if the plane called it five times.
+* **A cell that does not apply says `·`.** Forcing every invariant onto every scenario would fill the
+  table with green that means nothing.
+* **…but a cell may not go blank quietly.** `MUST_APPLY` pins which invariants each scenario has to
+  actually reach, because a mutation run that disabled the restart sweep turned a `100/100` cell into
+  `·` and the suite stayed green.
+
+The matrix was mutation-tested: the checks were re-run against deliberately broken versions of the
+plane, and the ones that still passed were rewritten. That is the difference between a table of
+green cells and evidence.
+
+`make eval` is the other tier and it is reported separately, never labelled "invariant": sixteen
+golden cases (`banking-v3`) driven through the real agent with a real model, N ≈ 20, five of them
+adversarial: an ambiguous answer that has to stay a question, a customer correcting the amount
+mid-flow, an unsupported action declined, prompt injection arriving through a *tool result* — the
+one place no gate looks — and a malformed tool call that must not become a claimed payment. Three of
+those are multi-turn, which the harness can grade because `Case.turn_checks` checks every turn
+rather than only the last.
 
 ### Demo tripwires
 
@@ -102,8 +187,11 @@ Deliberate, so the interesting paths are reachable from a chat:
 
 * **Ana** matches two contacts → `REQUIRE_MORE_INFO`.
 * **João** has never been paid; > R$ 500 to him is `high` risk → step-up below the amount threshold.
-  The assistant stops there on purpose: step-up is granted out of band, and V0 ships no channel
-  that can grant it.
+  The assistant stops there on purpose: step-up is granted out of band. The out-of-band channel now
+  exists — `trail step-up <intent_id>`, a different process reaching the shared database, which is
+  the shape of a real mobile-app callback.
+* A PIX over R$ 1.000 **after 20h São Paulo time** is refused by the regulator's rule rather than
+  escalated.
 * An amount whose cents are **.13** (e.g. `300,13`) is paid *and then* times out → `UNKNOWN`;
   ask the assistant to check and it reconciles.
 * The card has an **iFood R$ 129,00** charge dated yesterday.
@@ -116,15 +204,36 @@ to report "the customer approved" lets a sentence stand in for an authentication
 system prompt is short because the rules that matter are not in it: it makes the model a
 faithful relay of the `status` it received, and forbids claiming a payment without a `COMPLETED`.
 
-`make chat` talks to it. `make eval` runs `examples/banking/golden.py` — eleven cases, thresholds
+`make chat` talks to it. `make eval` runs `examples/banking/golden.py` — sixteen cases, thresholds
 pre-registered, two of them zero-tolerance policy (a claimed payment that did not happen; a blocked
 benign question).
 
+### The operator's commands
+
+Three CLI commands run **outside** the agent, against the shared database, and they still work when
+the agent is the thing that is down. `docs/runbook.md` is the procedure they belong to.
+
+| Command | For |
+|---|---|
+| `make intents` | list the intents waiting on a person, each with the command that resolves it |
+| `make reconcile INTENT=pix_abc123` | ask the bank what it did with one `UNKNOWN` intent |
+| `trail step-up <intent_id>` | grant strong assurance from another process, then re-run policy |
+
 ### What V0 leaves out, on purpose
 
-Identity (one hard-coded customer), a risk engine, real step-up, Open Finance, a real PIX rail,
-voice, a persistent store for intents and ledger, reconciliation infrastructure. Each is a
-`# ponytail:` comment naming the ceiling and the upgrade path; `grep -rn "ponytail:" src` lists them.
+A risk engine, Open Finance, a real PIX rail, voice, an authenticated step-up factor (the CLI
+command *is* the factor today), scoping the thread endpoints per customer, and any check that the
+bank's receipt matches the action that was confirmed. Each is either a `# ponytail:` comment naming
+the ceiling and the upgrade path — `grep -rn "ponytail:" src examples` lists them — or a row in
+`docs/threat-model.md`, which is the honest list: 22 adversaries, 18 with a named test, 4 still open.
+
+Two things that used to be on this list are not any more. **Identity** is no longer a constant in
+the tools module: the channel signs it, `src/trail/identity.py` verifies it, and a request that
+cannot present a valid `X-Trail-Identity` never reaches the agent. **Storage** is no longer only a
+dict: the plane writes through a `Store`, and `PgStore` puts intents and ledger events in Postgres
+so a separate process can reach them. The honest caveat on the second one is that the *served*
+agent still builds its plane over `MemoryStore` — the durability is proven at the store, not yet
+wired into the process that serves chat.
 
 ---
 
@@ -216,10 +325,14 @@ are no tokens to stream anyway, and the pipeline is the only honest thing to sho
 git clone https://github.com/hualcosa/banking-agent-control-plane && cd banking-agent-control-plane
 cp .env.example .env          # set TRAIL_LLM_API_KEY
 make test                     # the unit suite with coverage (fails under 90%), offline, no credentials needed
+make matrix                   # the invariant matrix: 5 × 11 cells, N=100 seeded trials, no model, seconds
 make up                       # the stack
 make chat                     # hold a conversation, and watch the pipeline behind it
 make eval                     # drive the golden set and print the scorecard
 ```
+
+`make test` and `make lint` are also what CI runs on every pull request — the same two commands, not
+a workflow that drifted from them.
 
 `make chat` is the CLI demo surface. It prints the answer and, under it, the rail: which gates ran,
 which were switched off, how long the model took, what it cost, and a link to the span tree. The
@@ -273,8 +386,14 @@ the empty Langfuse volumes.
 
 **The unit suite runs with no network and no credentials.** That is a design commitment, not an
 accident: it means a reviewer can clone the repository and verify every claim about the deterministic
-layer before deciding whether to trust the rest. `make test-integration` is the other tier: fourteen
-tests against the running stack, behind a marker.
+layer before deciding whether to trust the rest. `make matrix` is offline too. `make
+test-integration` is the tier that is not: twenty-two tests against the running stack, behind a
+marker — including the ones that prove an intent, its ownership and its ledger order survive the
+process that created them.
+
+Every request to a thread endpoint needs a signed identity header, so `TRAIL_IDENTITY_SECRET` has to
+be set for the stack to answer anything but 401. The CLI signs its own; `.env.example` ships a demo
+value, and the service says so loudly at startup when the secret is empty.
 
 ---
 
@@ -294,7 +413,7 @@ tests against the running stack, behind a marker.
 |---|---|
 | `ui` | The demo surface. nginx serving a built Vite bundle, and the reverse proxy that puts the app and the API on **one origin** — which is why there is no CORS middleware anywhere in this repository. |
 | `agent` | Your conversation. TRAIL owns the HTTP shell, the streaming, the persistence and the spans. You own what happens between them. |
-| `postgres` | Conversation state, when `TRAIL_CHECKPOINTER=postgres`, plus the two eval tables. The conversation tables are LangGraph's and it creates and migrates them itself — declaring a hand-written copy would mean being wrong about it on the first upgrade — so `db/schema.sql` holds only `eval_runs` and `eval_findings`, which are TRAIL's own data with no upstream owner. That is the test for whether a table belongs in the file at all. |
+| `postgres` | Conversation state, when `TRAIL_CHECKPOINTER=postgres`, plus four tables of this repository's own: `eval_runs`, `eval_findings`, and — since the control plane grew a durable store — `intents` and `ledger_events`. The conversation tables are LangGraph's and it creates and migrates them itself; declaring a hand-written copy would mean being wrong about it on the first upgrade. That is the test for whether a table belongs in `db/schema.sql` at all: it is there if nothing upstream owns it. |
 | `langfuse` | Self-hosted v4 — web, worker, ClickHouse, Redis, MinIO and its own Postgres. Six containers, because LLM observability is a different shape of problem from request tracing. The traces are the product, not a debugging aid you add later. |
 
 **One image, two roles.** The `agent` service and the CLI are the same build with a different entry
@@ -439,8 +558,8 @@ Each of these was argued and declined.
 | **A pluggable rule engine** | See §5. TRAIL owns when a check runs and what happens when it fails. Rules that satisfy every domain constrain none of them. |
 | **A hand-written trace table** | Per-call tokens, cost and latency live in Langfuse. A local table duplicating them would be a second source of truth for the same numbers — the one this repository can least afford to have disagree with itself. |
 | **Token streaming, for now** | The `messages` channel is already requested from the graph, so the wire contract does not change when it lands. What streams today is the pipeline, which is the honest thing to show for an agent whose answer is assembled from tool results. |
-| Authentication and multi-tenancy | One local stack, one trust boundary, no real data. Auth without a real identity provider and a real data boundary is theatre, and it models none of what makes auth hard. |
-| Database migrations | Two tables of TRAIL's own. `make clean` drops the volume and the init hook applies the schema again. |
+| A full auth stack and multi-tenancy | Still declined, but the line moved: the banking example needs to know *whose* money it is, so a signed channel header now authenticates every request (`src/trail/identity.py`). What is deliberately absent is a token format — no expiry, no audience, no rotation — and per-customer scoping of the thread endpoints. Both belong with a real identity provider, which is milestone 4's Cognito JWT verified at the same one line of plumbing. |
+| Database migrations | Four tables of this repository's own. `make clean` drops the volume and the init hook applies the schema again — and because initdb only runs on an empty volume, `PgStore` applies the schema on startup too. |
 | An operator console | The `ui` service is a demo of one conversation, not a workplace. No queue, no assignment, no sign-off, no auth. Those belong to a product, and the specialist review step they would serve is the one thing a person should do. |
 | An eval dashboard | `make eval` renders the metrics and the failure taxonomy legibly in a terminal, with no build step. Charting a run nobody has published is the most visible and least informative thing a repository can contain. |
 | Audio, telephony, ASR, TTS | Transport. It attaches at the client boundary, which is why that boundary is a service. Building it first spends week one on codecs and answering-machine detection, and none of the interesting problems live there. |
