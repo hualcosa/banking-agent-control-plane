@@ -152,6 +152,7 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
     "unit: offline and pure — no network, no database, no API key",
     "integration: requires the compose stack; run with `make test-integration`",
+    "matrix: the invariant matrix, N seeded trials per cell; run with `make matrix`",
 ]
 
 asyncio_mode = "auto"

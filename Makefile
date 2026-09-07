@@ -37,7 +37,7 @@ HOST_ENV := \
 	TRAIL_OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:$(LANGFUSE_WEB_PORT)/api/public/otel/v1/traces
 
 .DEFAULT_GOAL := help
-.PHONY: help up down logs chat eval ui-dev test test-integration fmt lint clean
+.PHONY: help up down logs chat eval intents reconcile ui-dev test matrix test-integration fmt lint clean
 
 help: ## List the targets
 	@grep -hE '^[a-z][a-z-]*:.*?## ' $(MAKEFILE_LIST) \
@@ -68,12 +68,27 @@ chat: .env ## Hold a conversation with the agent from the CLI
 eval: .env ## Run the mounted example's golden set against the running stack (`make up` first)
 	$(COMPOSE) run --rm client trail eval
 
+# The operator's two commands, and they run on the HOST rather than through
+# `compose run client`: the client service waits for the agent to be healthy,
+# and the whole point of these is that they still work when the agent is the
+# thing that is down. They reach Postgres directly — see docs/runbook.md.
+intents: ## List the intents waiting on a person (reads Postgres; works with the agent down)
+	@$(HOST_ENV) $(UV) run trail intents
+
+reconcile: ## Resolve one UNKNOWN intent by asking the bank: make reconcile INTENT=pix_abc123
+	@test -n "$(INTENT)" || { echo 'usage: make reconcile INTENT=pix_abc123' >&2; exit 2; }
+	@$(HOST_ENV) $(UV) run trail reconcile $(INTENT)
+
 ui-dev: ## Run the Vite dev server on the host against the running stack (`make up` first)
 	cd ui && npm install && npm run dev
 
 test: ## Run the unit tests with coverage (fails under 90%) — offline, no Docker, no database, no API key
 	@$(HOST_ENV) TRAIL_LLM_API_KEY=unit-tests-never-call-the-api \
 		$(UV) run --extra dev pytest -m unit --cov
+
+matrix: ## Print the invariant matrix (pytest over the control plane, no LLM, no Docker)
+	@$(HOST_ENV) TRAIL_LLM_API_KEY=matrix-never-calls-the-api \
+		$(UV) run --extra dev pytest -m matrix -p no:randomly -q -s --no-header
 
 test-integration: ## Run the integration tests against the running stack (`make up` first)
 	@$(HOST_ENV) $(UV) run --extra dev pytest -m integration
