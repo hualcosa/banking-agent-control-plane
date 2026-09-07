@@ -149,6 +149,18 @@ instead of only between 20h and 06h.
   401 and never reaches the agent — with one message for every failure, so the response is not an
   oracle. Two customers are isolated end to end, and the customer the plane acts for came from
   `configurable`, never from the tools module.
+* A conversation belongs to the customer who opened it. Reading, deleting or taking a turn on
+  someone else's thread is a 404 identical to one that never existed — including the turn endpoints,
+  where the leak was worst: a turn on a borrowed `thread_id` would load that customer's checkpoint
+  and stream their conversation back as context, a transcript read through the endpoint that returns
+  no transcript. An unknown id is still *claimed* rather than refused, because that is how a
+  conversation resumes after a restart.
+
+  Two consequences worth knowing. Index records written before this carry no owner, and an unowned
+  record is nobody's rather than everybody's — on an existing volume, pre-change threads disappear
+  from the sidebar while their checkpoints stay untouched; `make clean` remains the only migration.
+  And `DELETE` is no longer an idempotent 204 for any id: an idempotent 204 is an existence oracle,
+  so deleting twice is a 404 the second time.
 * A transcript the recogniser is unsure of never moves money: below 0.55 the voice adapter refuses
   to propose at all — a transcript nobody can read is not a quiet instruction — and below 0.85 it
   raises risk rather than deciding. Every magnitude collapse ("trezentos" → "treze") and every
@@ -402,7 +414,7 @@ the empty Langfuse volumes.
 **The unit suite runs with no network and no credentials.** That is a design commitment, not an
 accident: it means a reviewer can clone the repository and verify every claim about the deterministic
 layer before deciding whether to trust the rest. `make matrix` is offline too. `make
-test-integration` is the tier that is not: twenty-two tests against the running stack, behind a
+test-integration` is the tier that is not: twenty-three tests against the running stack, behind a
 marker — including the ones that prove an intent, its ownership and its ledger order survive the
 process that created them.
 

@@ -13,12 +13,12 @@ O gateway **executa**. O LLM nunca encosta no dinheiro diretamente.
 linguagem natural → LLM → ação tipada → regras determinísticas → banco
 ```
 
-## Onde estamos (depois de S1–S5 e do primeiro commit de voz, 21 commits desde `f043ea3`)
+## Onde estamos (depois de S1–S5 e do começo do marco 5, 25 commits desde `f043ea3`)
 
 | Marco | Estado | Evidência |
 |---|---|---|
-| 1 — ameaças e metas | **feito** | `docs/threat-model.md`, revisado em S5: 23 adversários, 19 com teste nomeado, 4 lacunas honestas |
-| 2 — endurecer o V1 | **feito** | `make lint && make test` (410 testes unitários, gate de 90%) + `make test-integration` (22 testes) |
+| 1 — ameaças e metas | **feito** | `docs/threat-model.md`, revisado no marco 5: 23 adversários, 20 com teste nomeado, 3 lacunas honestas |
+| 2 — endurecer o V1 | **feito** | `make lint && make test` (410 testes unitários, gate de 90%) + `make test-integration` (23 testes) |
 | 3 — evidência de falha | **feito** | `make matrix`: 5 invariantes × 11 cenários × N=100, sem LLM |
 | 4 — AWS + operação | **não começou** | o `docs/runbook.md` já existe (escrito em S5, junto do `trail intents`/`trail reconcile`), mas nunca foi executado contra produção porque não há produção |
 | 5 — voz | **em andamento agora** | primeiro commit dentro; `git diff --stat before-voice -- src/control_plane/` = 63 inserções, 5 remoções em 3 arquivos — e são dois números, não um (ver o marco) |
@@ -81,12 +81,14 @@ palavra. Sem meta de latência, o marco 4 não sabe que infra escolher.
 **Terminou quando:** existe `docs/threat-model.md` com tabela adversário → invariante → teste que vai provar.
 
 **Fechado.** O arquivo existe e é falsificável em um comando (o `grep` no fim
-dele). Revisado ao fim de S5: 23 linhas, 19 cobertas, 4 lacunas — A2 (nada
-screena saída de tool), A11 (fabricação no canal, medida com LLM), A14 (o recibo
-do banco nunca é conferido contra a ação confirmada) e A22 (endpoints de thread
-autenticam mas não escopam por cliente). Nenhuma tem tarefa no plano. A linha
-A23 (transcrição errada tratada como instrução) entrou com a voz e já nasceu
-coberta.
+dele). Revisado durante o marco 5: 23 linhas, 20 cobertas, 3 lacunas — A2
+(nada screena saída de tool), A11 (fabricação no canal, medida com LLM) e A14 (o
+recibo do banco nunca é conferido contra a ação confirmada). Nenhuma das três tem
+tarefa no plano, e A14 é a única lacuna original que nenhuma sessão tocou. Duas
+linhas nasceram depois do arquivo: A22 (endpoints de thread autenticavam sem
+escopar) foi aberta pelo próprio trabalho de identidade e **fechada** dentro do
+marco 5 — a correção mostrou que o buraco incluía também os endpoints de turno —
+e A23 (transcrição errada tratada como instrução) entrou com a voz já coberta.
 
 ---
 
@@ -407,8 +409,7 @@ Perde a voz como história própria — o diff vira uma linha do post final.
 **Próximo passo quando voltar:** terminar o marco 5 (uma chamada real de STT,
 para o diff não ser infalsificável) e então o marco 4 inteiro, que é o único
 grande bloco intocado: `infra-cdk/`, contrato `/invocations` + `/ping`, imagem
-arm64, deploy, e o `UNKNOWN` forçado em produção. Duas dívidas pequenas ficam no
-caminho e valem ser pagas antes do deploy: ligar o serviço ao `PgStore` (hoje só
-o CLI o usa) e escopar os endpoints de thread por cliente (A22 do threat model).
+arm64, deploy, e o `UNKNOWN` forçado em produção. Uma dívida pequena fica no caminho e vale
+ser paga antes do deploy: ligar o serviço ao `PgStore`, que hoje só o CLI abre.
 O plano de execução está em `docs/execution-plan.md`; as decisões já tomadas,
 com evidência, em `docs/adr/`.

@@ -52,8 +52,8 @@ Dois achados da exploração mudaram o desenho original:
 
 ## Tarefas (esforço: S<1h · M≈meia sessão · L≈sessão)
 
-> **Estado das tarefas — nota acrescentada depois de S1–S5 e do primeiro commit
-> de voz.** Este plano é documento histórico: o raciocínio abaixo é o de
+> **Estado das tarefas — nota acrescentada depois de S1–S5 e do começo do
+> marco 5.** Este plano é documento histórico: o raciocínio abaixo é o de
 > 2026-08-31 e fica como está, inclusive onde a execução discordou dele. A
 > coluna **Estado** é a única coisa acrescentada, e diz apenas *feito* ou *não
 > começou* — o que cada tarefa entregou está no `ROADMAP.md` (marco por marco,
@@ -78,6 +78,10 @@ Dois achados da exploração mudaram o desenho original:
 >   pode passar de `100/100` a "não se aplica" sem ficar vermelha — foi o que
 >   aconteceu numa rodada de mutação que desligou o sweep. `MUST_APPLY` fixa
 >   quais invariantes cada cenário tem de alcançar de fato.
+> * **O T9 abriu um achado que não estava em lugar nenhum do plano.** Com dois
+>   clientes reais, os endpoints de thread passaram a autenticar sem escopar —
+>   entrou no threat model como A22 e foi corrigido no marco 5, incluindo os
+>   endpoints de turno, que era a metade pior e não estava na linha original.
 
 | # | Tarefa | Pré-req | Esf | Arquivos | Verificação | Estado |
 |---|---|---|---|---|---|---|
