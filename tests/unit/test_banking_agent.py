@@ -44,6 +44,7 @@ async def drive(
     settings: Settings,
     thread_id: str = "t1",
     persistence: Any = None,
+    customer_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     spec = load_spec("banking")
     agent = build_agent(
@@ -52,7 +53,11 @@ async def drive(
     stages: list[dict[str, Any]] = []
     answer = ""
     async for name, payload in run_turn(
-        agent, thread_id=thread_id, message=message, settings=settings
+        agent,
+        thread_id=thread_id,
+        message=message,
+        settings=settings,
+        customer_id=customer_id,
     ):
         if name == STAGE:
             stages.append(payload)
@@ -161,10 +166,25 @@ async def test_reads_go_through_the_plane_and_are_audited(
 
 
 class _Runtime:
-    """The two fields of ``ToolRuntime`` the tools read."""
+    """The ``config`` field of ``ToolRuntime``, which is where identity lives.
 
-    def __init__(self, thread_id: str | None = "t1") -> None:
-        self.config = {"configurable": {"thread_id": thread_id}} if thread_id else None
+    ``customer_id`` defaults to ``None`` — the shape an in-process caller with
+    no channel produces. Passing one is what ``app.py`` does after verifying
+    the channel's signed header.
+    """
+
+    def __init__(
+        self, thread_id: str | None = "t1", customer_id: str | None = None
+    ) -> None:
+        if thread_id is None and customer_id is None:
+            self.config = None
+            return
+        configurable: dict[str, Any] = {}
+        if thread_id is not None:
+            configurable["thread_id"] = thread_id
+        if customer_id is not None:
+            configurable["customer_id"] = customer_id
+        self.config = {"configurable": configurable}
 
 
 def test_amount_parsing_accepts_brazilian_formats() -> None:
@@ -187,7 +207,79 @@ def test_a_negative_amount_never_reaches_the_plane(fresh_plane: ControlPlane) ->
 
 
 def test_a_tool_without_a_thread_still_has_a_session() -> None:
-    assert tools.context_for(_Runtime(None)).session_id == "no-thread"
+    """An in-process caller with no channel still gets a whole ``Context``.
+
+    ``DEFAULT_CUSTOMER_ID`` is a fixture for exactly this caller and nothing
+    else: an HTTP request cannot arrive here without a customer, because
+    ``app.py`` answers 401 before the graph runs — see
+    ``test_app.py::test_a_request_without_an_identity_header_is_401_and_never_reaches_the_agent``.
+    """
+    context = tools.context_for(_Runtime(None))
+    assert context.session_id == "no-thread"
+    assert context.customer_id == tools.DEFAULT_CUSTOMER_ID
+
+
+def test_the_customer_comes_from_configurable_not_from_this_module() -> None:
+    """Whatever ``app.py`` put in ``configurable`` wins over the fixture."""
+    context = tools.context_for(_Runtime("t1", customer_id="cust_from_the_channel"))
+    assert context.customer_id == "cust_from_the_channel"
+    assert context.session_id == "t1"
+
+
+def test_two_customers_in_one_session_cannot_read_each_other(
+    fresh_plane: ControlPlane,
+) -> None:
+    """Invariant I2, adversary A17, at the tool boundary.
+
+    Both runtimes carry the *same* session id, so session scoping is neutral
+    here and the only thing standing between the two callers is the customer
+    the channel supplied. Every borrowed id comes back as the same non-answer
+    a made-up one would, and none of the four replies leaks the recipient or
+    the amount — a refusal that quotes the payment it refused is still a leak.
+    """
+    mine = _Runtime("shared-session", customer_id="cust_a")
+    theirs = _Runtime("shared-session", customer_id="cust_b")
+
+    tools.propose_pix(mine, "Renata", "300")
+    (intent,) = fresh_plane.intents.values()
+    assert intent.context.customer_id == "cust_a"
+
+    replies = [
+        tools.confirm_pix(theirs, intent.confirmation_id),
+        tools.cancel_pix(theirs, intent.confirmation_id),
+        tools.check_pix(theirs, intent.id),
+        tools.explain_action(theirs, intent.id),
+    ]
+
+    assert fresh_plane.bank.payments == {}
+    assert intent.state == "AWAITING_CONFIRMATION"
+    assert intent.confirmed_by is None
+    for reply in replies[:3]:
+        assert '"DENY"' in reply
+    assert '"nenhum registro"' in replies[3]
+    assert not any("Renata" in reply or "300" in reply for reply in replies)
+
+    # And the owner is unaffected by the attempt: their own ids still work.
+    assert '"confirmation_id"' in tools.explain_action(mine, intent.id)
+    assert '"CANCELLED"' in tools.cancel_pix(mine, intent.confirmation_id)
+
+
+async def test_the_turn_carries_the_channels_customer_into_the_plane(
+    settings: Settings, fresh_plane: ControlPlane
+) -> None:
+    """``run_turn(customer_id=...)`` → ``configurable`` → ``context_for``.
+
+    The full seam, through the real graph: what the service resolved from the
+    header is what the control plane records as the principal.
+    """
+    model = scripted(
+        calls("propose_pix", recipient="Renata", amount="300"), says("Confirma?")
+    )
+    await drive(model, "manda 300 pra Renata", settings, customer_id="cust_from_header")
+
+    (intent,) = fresh_plane.intents.values()
+    assert intent.context.customer_id == "cust_from_header"
+    assert intent.context.session_id == "t1"
 
 
 def test_the_remaining_tools_round_trip(fresh_plane: ControlPlane) -> None:

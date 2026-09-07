@@ -27,6 +27,7 @@ import pytest
 from rich.console import Console
 
 from trail import cli
+from trail.config import get_settings
 from trail.evals import store as store_module
 from trail.evals.cases import (
     Case,
@@ -37,9 +38,29 @@ from trail.evals.cases import (
     not_contains,
 )
 from trail.evals.metrics import Metric, RunReport
+from trail.identity import HEADER as IDENTITY_HEADER
+from trail.identity import verify
 from trail.runtime.events import sse
 
 pytestmark = pytest.mark.unit
+
+#: The CLI signs with this; the fake service below verifies with it, which is
+#: what makes "the header the CLI sends is one a service would accept" a claim
+#: these tests can actually check rather than assert about a literal.
+SECRET = "unit-test-identity-secret"
+
+
+@pytest.fixture(autouse=True)
+def _identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every command that talks to the agent signs an identity first.
+
+    Without a secret the CLI refuses to run at all — which is itself a test
+    below — so the rest of the suite needs one, exactly as a real terminal
+    gets one from ``.env``.
+    """
+    monkeypatch.setenv("TRAIL_IDENTITY_SECRET", SECRET)
+    monkeypatch.setenv("TRAIL_CUSTOMER_ID", "cust_123")
+    get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -793,3 +814,53 @@ def test_main_passes_the_concurrency_flag_through_to_evaluate(
     out = capsys.readouterr().out
     assert code == 0
     assert "concorrência" in out and "3" in out
+
+
+# ---------------------------------------------------------------------------
+# identity — the CLI is standing in for the channel, so the CLI signs
+# ---------------------------------------------------------------------------
+
+
+async def test_chat_signs_an_identity_header_a_service_would_accept(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every request the CLI makes carries a header that verifies to cust_123.
+
+    Verified rather than compared to a literal: the assertion is that the
+    service's own ``verify`` resolves the CLI's header to the configured
+    customer, which is the property ``make chat`` depends on.
+    """
+    seen: list[str | None] = []
+    inner = open_thread_handler(turn_body())
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(IDENTITY_HEADER))
+        return inner(request)
+
+    monkeypatch.setattr(cli, "httpx", fake_httpx(handle))
+    scripted_input(monkeypatch, "oi", "sair")
+    assert await cli.chat("http://agent") == 0
+    capsys.readouterr()
+
+    assert len(seen) == 2  # POST /threads, then the turn
+    assert all(verify(value, SECRET) == "cust_123" for value in seen)
+
+
+async def test_chat_refuses_to_run_with_no_identity_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client that sends an unverifiable header presents as a server bug.
+
+    So it does not send one: it stops with a message naming the variable, and
+    never opens a connection — the fake transport would raise if it did.
+    """
+    monkeypatch.setenv("TRAIL_IDENTITY_SECRET", "")
+    get_settings.cache_clear()
+
+    def explode(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the CLI must not reach the agent unsigned")
+
+    monkeypatch.setattr(cli, "httpx", fake_httpx(explode))
+    with pytest.raises(cli.CliError) as raised:
+        await cli.chat("http://agent")
+    assert "TRAIL_IDENTITY_SECRET" in str(raised.value)

@@ -39,6 +39,8 @@ from trail.evals.cases import CaseOutcome
 from trail.evals.judge import bind_judge, build_session
 from trail.evals.metrics import RunReport
 from trail.evals.runner import run_golden_set
+from trail.identity import HEADER as IDENTITY_HEADER
+from trail.identity import sign as sign_identity
 from trail.runtime.events import duration, iter_sse
 from trail.runtime.registry import load_golden
 
@@ -70,6 +72,30 @@ class CliError(Exception):
     def __init__(self, message: str, hint: str = ""):
         super().__init__(message)
         self.hint = hint
+
+
+def identity_headers() -> dict[str, str]:
+    """The signed identity this client presents on every request.
+
+    The CLI is standing in for the channel — the piece that, in production,
+    has actually authenticated the person — so it is the piece that signs.
+    ``TRAIL_CUSTOMER_ID`` is who it claims to be and ``TRAIL_IDENTITY_SECRET``
+    is what makes the claim checkable; with no secret there is nothing to sign
+    with, and saying so here is far cheaper to debug than a 401 from a service
+    that (correctly) refuses to explain itself.
+
+    Milestone 4 replaces this with a Cognito login: the same header slot, a
+    token instead of a MAC, and this function is the only part that changes.
+    """
+    settings = get_settings()
+    secret = settings.identity_secret.get_secret_value()
+    if not secret:
+        raise CliError(
+            "TRAIL_IDENTITY_SECRET não está definido: sem ele não há como "
+            "assinar a identidade e o agente recusa todo pedido com 401",
+            hint="copie .env.example para .env, ou exporte TRAIL_IDENTITY_SECRET",
+        )
+    return {IDENTITY_HEADER: sign_identity(settings.customer_id, secret)}
 
 
 def _render_rail(console: Console, stages: list[dict[str, Any]]) -> None:
@@ -182,7 +208,10 @@ async def _turn(
 
 async def chat(base_url: str) -> int:
     console = Console(theme=THEME)
-    async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
+    headers = identity_headers()
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=120.0, headers=headers
+    ) as client:
         try:
             opened = await client.post("/threads")
             opened.raise_for_status()
@@ -248,7 +277,9 @@ async def evaluate(base_url: str, concurrency: int = 4) -> int:
     # alternative is inspecting case bodies to guess whether one does.
     session = build_session(settings)
     started_at = datetime.now(UTC)
-    async with httpx.AsyncClient(base_url=base_url, timeout=180.0) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=180.0, headers=identity_headers()
+    ) as client:
         try:
             (await client.get("/healthz", timeout=10.0)).raise_for_status()
         except httpx.HTTPError as exc:

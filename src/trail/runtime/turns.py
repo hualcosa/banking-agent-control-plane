@@ -84,8 +84,18 @@ async def run_turn(
     thread_id: str,
     message: str,
     settings: Settings,
+    customer_id: str | None = None,
 ) -> AsyncIterator[Frame]:
     """Drive one turn and yield its frames.
+
+    ``customer_id`` is who the turn acts for, and it travels in ``configurable``
+    alongside the thread — the one dict LangGraph hands to every tool. That is
+    the point: the tools read identity from the same place they read the
+    session, so nothing in the agent, the prompt or the model's output has a
+    say in whose account is touched. ``app.py`` resolves it from the channel's
+    signed header and is the only caller that should ever pass one; ``None``
+    is for in-process callers (tests, direct drives) that have no channel, and
+    it leaves the key out rather than inventing a customer here.
 
     ``stream_mode`` asks for three channels and uses two of them today.
     ``custom`` is the rail. ``values`` is how the finished message is recovered
@@ -95,7 +105,10 @@ async def run_turn(
     this contract.
     """
     started = time.perf_counter_ns()
-    config = {"configurable": {"thread_id": thread_id}}
+    configurable: dict[str, Any] = {"thread_id": thread_id}
+    if customer_id is not None:
+        configurable["customer_id"] = customer_id
+    config = {"configurable": configurable}
     failure: BaseException | None = None
     trace_id: str | None = None
     final: list[Any] = []

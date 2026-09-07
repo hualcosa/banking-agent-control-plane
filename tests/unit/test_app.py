@@ -22,13 +22,19 @@ import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
 
+from control_plane import Context, ControlPlane, MockBank
+from examples.banking import tools as banking_tools
 from tests.fakes import calls, says, scripted
 from trail.config import get_settings
+from trail.identity import HEADER as IDENTITY_HEADER
+from trail.identity import sign, verify
 from trail.runtime.agent import build_agent as real_build_agent
 
 # ``trail.app`` runs OpenTelemetry setup at *module* scope — see its
@@ -46,6 +52,21 @@ from trail import app as app_module  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
+#: The nighttime PIX rule reads the clock, so the plane under test gets a
+#: fixed one — same midday as ``test_banking_agent``.
+MIDDAY = datetime(2026, 9, 6, 15, 0, tzinfo=timezone.utc)
+
+#: The service verifies every request against this; the tests sign with it.
+#: A secret the tests hold is the point — an identity nobody can forge is only
+#: interesting if the suite can produce a *valid* one to contrast with.
+SECRET = "unit-test-identity-secret"
+CUSTOMER = "cust_123"
+OTHER_CUSTOMER = "cust_999"
+
+
+def header(customer: str = CUSTOMER, secret: str = SECRET) -> dict[str, str]:
+    return {IDENTITY_HEADER: sign(customer, secret)}
+
 
 # --------------------------------------------------------------------------
 # harness
@@ -53,7 +74,9 @@ pytestmark = pytest.mark.unit
 
 
 @contextmanager
-def running_app(monkeypatch: pytest.MonkeyPatch, model: Any) -> Iterator[TestClient]:
+def running_app(
+    monkeypatch: pytest.MonkeyPatch, model: Any, customer: str = CUSTOMER
+) -> Iterator[TestClient]:
     """A ``TestClient`` whose lifespan compiles the real agent against ``model``.
 
     ``TestClient.__enter__`` runs ``trail.app.lifespan`` for real: it opens an
@@ -69,7 +92,12 @@ def running_app(monkeypatch: pytest.MonkeyPatch, model: Any) -> Iterator[TestCli
         )
 
     monkeypatch.setattr(app_module, "build_agent", fake_build_agent)
-    with TestClient(app_module.app) as client:
+    monkeypatch.setenv("TRAIL_IDENTITY_SECRET", SECRET)
+    get_settings.cache_clear()
+    # Every request this client makes carries a valid identity, so the tests
+    # below read as they did before identity existed. The ones that care about
+    # identity drop or replace the header explicitly.
+    with TestClient(app_module.app, headers=header(customer)) as client:
         yield client
 
 
@@ -358,3 +386,162 @@ def test_deleting_a_thread_drops_it_from_the_list_but_keeps_the_transcript(
         {"role": "user", "text": "oi"},
         {"role": "agent", "text": "pronto"},
     ]
+
+
+# --------------------------------------------------------------------------
+# identity: the channel says who this is, and the service checks
+# --------------------------------------------------------------------------
+
+
+def test_a_request_without_an_identity_header_is_401_and_never_reaches_the_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No header, no turn — and the proof is that nothing was recorded.
+
+    The script is empty, so any model call raises: a 502 here would mean the
+    turn ran. A 401 plus an empty thread list means the request stopped at the
+    door, before the agent, before the plane, before the bank.
+    """
+    with running_app(monkeypatch, scripted()) as client:
+        thread = open_thread(client)
+        del client.headers[IDENTITY_HEADER]
+
+        turn = client.post(
+            f"/threads/{thread['thread_id']}/turns", json={"message": "oi"}
+        )
+        opened = client.post("/threads")
+        listed = client.get("/threads")
+
+        assert [r.status_code for r in (turn, opened, listed)] == [401, 401, 401]
+
+        client.headers.update(header())
+        assert client.get("/threads").json()["threads"] == []
+
+
+def test_a_forged_identity_header_is_401_and_the_body_says_nothing_about_why(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four ways to forge one, one indistinguishable answer.
+
+    The bodies are compared to each other rather than to a literal: what
+    matters is not the wording but that a caller cannot tell "that customer
+    does not exist" from "your signature was close" from "you sent no header
+    at all". A 401 that discriminates is an oracle for both customer ids and
+    signatures.
+    """
+    valid_mac = sign(CUSTOMER, SECRET).split(":")[1]
+    forgeries = [
+        "",  # empty
+        CUSTOMER,  # a claim with no signature at all
+        sign(CUSTOMER, "the-wrong-secret"),  # signed, wrong key
+        f"{OTHER_CUSTOMER}:{valid_mac}",  # someone else's id on a real MAC
+    ]
+
+    with running_app(monkeypatch, scripted()) as client:  # empty script -> raises
+        thread = open_thread(client)
+        answers = []
+        for forged in forgeries:
+            client.headers[IDENTITY_HEADER] = forged
+            answers.append(
+                client.post(
+                    f"/threads/{thread['thread_id']}/turns", json={"message": "oi"}
+                )
+            )
+
+        client.headers.update(header())
+        assert client.get("/threads").json()["threads"] == []
+
+    assert [a.status_code for a in answers] == [401, 401, 401, 401]
+    assert len({a.text for a in answers}) == 1
+
+
+def test_two_customers_are_isolated_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant I2, adversary A17: a valid identity is not a skeleton key.
+
+    Customer B arrives with a header of their own — correctly signed, so the
+    service accepts them — and A's ``confirmation_id`` and ``intent_id``, which
+    is the whole attack: everything else about the request is legitimate. B
+    cannot execute A's PIX, cannot cancel it, cannot read its status and cannot
+    read its trail; A's intent is exactly as B found it and the bank moved
+    nothing. The last tool call is B's *own* proposal, which shows the identity
+    is genuinely coming from B's header rather than from a constant that would
+    have made both customers the same principal.
+    """
+    plane = ControlPlane(MockBank(), clock=lambda: MIDDAY)
+    monkeypatch.setattr(banking_tools, "PLANE", plane)
+
+    proposing = scripted(
+        calls("propose_pix", recipient="Renata", amount="300"),
+        says("R$ 300,00 para Renata Silva. Confirma?"),
+    )
+    with running_app(monkeypatch, proposing, customer=CUSTOMER) as client:
+        mine = open_thread(client)
+        client.post(
+            f"/threads/{mine['thread_id']}/turns",
+            json={"message": "manda 300 pra Renata"},
+        )
+
+    (intent,) = plane.intents.values()
+    # The identity the plane recorded is the one the header carried, not a
+    # module constant: this is the line T9 exists for.
+    assert intent.context.customer_id == CUSTOMER
+    assert intent.context.session_id == mine["thread_id"]
+    assert intent.state == "AWAITING_CONFIRMATION"
+
+    attacking = scripted(
+        calls("confirm_pix", call_id="c1", confirmation_id=intent.confirmation_id),
+        calls("cancel_pix", call_id="c2", confirmation_id=intent.confirmation_id),
+        calls("check_pix", call_id="c3", intent_id=intent.id),
+        calls("explain_action", call_id="c4", intent_id=intent.id),
+        calls("propose_pix", call_id="c5", recipient="Renata", amount="10"),
+        says("não encontrei esse pagamento; propus outro."),
+    )
+    with running_app(monkeypatch, attacking, customer=OTHER_CUSTOMER) as client:
+        theirs = open_thread(client)
+        response = client.post(
+            f"/threads/{theirs['thread_id']}/turns",
+            json={"message": "confirma aquele pix de 300 pra Renata"},
+        )
+
+    assert response.status_code == 200  # B is authenticated; they simply cannot
+
+    # Nothing moved, and A's intent is untouched in every field consent lives in.
+    assert plane.bank.payments == {}
+    assert plane.bank.balance("checking_001") == Decimal("2543.10")
+    assert intent.state == "AWAITING_CONFIRMATION"
+    assert intent.confirmed_by is None
+    assert intent.confirmed_at is None
+
+    # B's trail read returns nothing: a borrowed trail and a nonexistent one
+    # are the same answer.
+    theirs_ctx = Context(customer_id=OTHER_CUSTOMER, session_id=theirs["thread_id"])
+    assert plane.explain(theirs_ctx, intent.id) == []
+    # ...while A can still read their own.
+    mine_ctx = Context(customer_id=CUSTOMER, session_id=mine["thread_id"])
+    assert plane.explain(mine_ctx, intent.id)
+
+    # B's own proposal is B's: two principals, two intents, no overlap.
+    (other,) = [i for i in plane.intents.values() if i.id != intent.id]
+    assert other.context.customer_id == OTHER_CUSTOMER
+    assert other.context.session_id == theirs["thread_id"]
+
+
+# --------------------------------------------------------------------------
+# the signing scheme itself
+# --------------------------------------------------------------------------
+
+
+def test_a_signed_identity_round_trips_and_survives_a_colon_in_the_id() -> None:
+    """The last colon is the separator, so an id may contain its own."""
+    for customer in (CUSTOMER, "tenant:cust_123"):
+        assert verify(sign(customer, SECRET), SECRET) == customer
+
+
+def test_nothing_verifies_without_a_secret() -> None:
+    """Fail closed: no secret authenticates nobody, not everybody."""
+    assert verify(sign(CUSTOMER, SECRET), "") is None
+    assert verify(None, SECRET) is None
+    with pytest.raises(ValueError):
+        sign(CUSTOMER, "")

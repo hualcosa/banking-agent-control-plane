@@ -133,6 +133,26 @@ class Settings(BaseSettings):
 
     service_name: str = "trail-agent"
 
+    # --- Identity ----------------------------------------------------------
+
+    #: Shared secret the channel signs the customer id with, and the service
+    #: verifies (``trail.identity``). Empty — the default — authenticates
+    #: **nobody**: every request to a thread endpoint is refused with 401.
+    #: That is deliberate. A missing auth secret that opens the door is the
+    #: failure mode this setting exists to prevent, so the safe default is the
+    #: one that is loudly broken rather than quietly wide open.
+    #:
+    #: A shared HMAC secret is a milestone-3 stand-in for the channel's real
+    #: identity provider; milestone 4 replaces it with a Cognito JWT verified
+    #: at the same point in ``trail.app``.
+    identity_secret: SecretStr = SecretStr("")
+
+    #: Which customer the **CLI** presents when it signs that header. It is a
+    #: client-side setting, not a server-side one: the service never reads it,
+    #: and nothing about a request is trusted because this says so. It stands
+    #: in for the login `trail chat` does not have yet.
+    customer_id: str = "cust_123"
+
     # --- The dials ----------------------------------------------------------
 
     #: Which gates run. This is the whole guardrail configuration: the runtime

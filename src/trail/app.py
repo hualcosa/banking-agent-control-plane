@@ -29,12 +29,14 @@ from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from trail import costs
 from trail.config import Settings, get_settings
+from trail.identity import HEADER as IDENTITY_HEADER
+from trail.identity import verify as verify_identity
 from trail.runtime.agent import build_agent
 from trail.runtime.checkpointers import open_persistence
 from trail.runtime.events import SSE_HEADERS, error_json, sse
@@ -146,6 +148,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             store.kind,
             store.durable,
         )
+        if not settings.identity_secret.get_secret_value():
+            # Said once, loudly, at startup: with no secret nothing can present
+            # a verifiable identity, so every thread endpoint answers 401 and
+            # the service looks broken rather than unauthenticated. Better a
+            # line in the log than an afternoon spent on the client.
+            logger.warning(
+                "TRAIL_IDENTITY_SECRET is empty: no request can authenticate, "
+                "every thread endpoint will answer 401"
+            )
         yield
 
 
@@ -178,6 +189,42 @@ setup_telemetry(get_settings().service_name, app)
 
 def _settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+#: One message for every way identity can fail: absent header, malformed
+#: header, wrong secret, signature for a customer that does not exist. A 401
+#: that says *which* is an oracle — it tells an attacker whether a customer id
+#: is real and how close a forged signature came — so this endpoint answers the
+#: same way to all of them, and says nothing a caller did not already know.
+_UNAUTHENTICATED = "identidade ausente ou inválida"
+
+
+def customer_id(request: Request) -> str:
+    """The customer this request acts for, resolved from the channel.
+
+    This function is the *whole* identity resolution in the service. Everything
+    downstream — ``run_turn``, the ``configurable`` dict, ``context_for``, the
+    control plane's principal checks — takes the customer as a value and never
+    asks where it came from, which is what makes swapping the scheme a change
+    here and nowhere else.
+
+    Milestone 4 does exactly that swap: the Cognito JWT authorizer in front of
+    AgentCore Runtime forwards the token, and this body becomes "verify the
+    signature against the JWKS, read the ``sub`` claim". The resolver changes;
+    the plumbing behind it does not. Keep it that way — a customer id that
+    enters through any other door (a request body, a tool argument, a value the
+    model repeats) is an identity the model can choose, which is the entire
+    thing this seam exists to prevent.
+    """
+    resolved = verify_identity(
+        request.headers.get(IDENTITY_HEADER),
+        _settings(request).identity_secret.get_secret_value(),
+    )
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=_UNAUTHENTICATED
+        )
+    return resolved
 
 
 def _store(request: Request):
@@ -215,6 +262,11 @@ def _readable_messages(messages: list) -> list[Message]:
     "/threads",
     response_model=StartThreadResponse,
     status_code=status.HTTP_201_CREATED,
+    # Authentication only: this endpoint does nothing per-customer, but an
+    # endpoint that answers an unauthenticated caller is a way in, and the
+    # cheapest way to have no unauthenticated way in is for every route that
+    # is not ``/healthz`` to require the same header.
+    dependencies=[Depends(customer_id)],
 )
 async def start_thread(request: Request) -> StartThreadResponse:
     """Open a thread.
@@ -239,7 +291,12 @@ async def start_thread(request: Request) -> StartThreadResponse:
 
 
 @app.post("/threads/{thread_id}/turns/stream", response_class=StreamingResponse)
-async def stream_turn(thread_id: str, body: TurnRequest, request: Request):
+async def stream_turn(
+    thread_id: str,
+    body: TurnRequest,
+    request: Request,
+    customer: str = Depends(customer_id),
+):
     """Run one turn, streaming its frames as Server-Sent Events.
 
     This always answers 200, even when the turn fails. By the time anything can
@@ -254,7 +311,11 @@ async def stream_turn(thread_id: str, body: TurnRequest, request: Request):
 
     async def frames() -> AsyncIterator[str]:
         async for name, payload in run_turn(
-            agent, thread_id=thread_id, message=body.message, settings=settings
+            agent,
+            thread_id=thread_id,
+            message=body.message,
+            settings=settings,
+            customer_id=customer,
         ):
             yield sse(name, error_json(payload) if name == ERROR else payload)
         # After the frames, so a client is never waiting on a write it cannot
@@ -268,7 +329,12 @@ async def stream_turn(thread_id: str, body: TurnRequest, request: Request):
 
 
 @app.post("/threads/{thread_id}/turns")
-async def submit_turn(thread_id: str, body: TurnRequest, request: Request) -> dict:
+async def submit_turn(
+    thread_id: str,
+    body: TurnRequest,
+    request: Request,
+    customer: str = Depends(customer_id),
+) -> dict:
     """Run one turn and return only the answer.
 
     Drains the same generator the streaming endpoint renders. One
@@ -281,7 +347,11 @@ async def submit_turn(thread_id: str, body: TurnRequest, request: Request) -> di
     answer: dict | None = None
 
     async for name, payload in run_turn(
-        agent, thread_id=thread_id, message=body.message, settings=settings
+        agent,
+        thread_id=thread_id,
+        message=body.message,
+        settings=settings,
+        customer_id=customer,
     ):
         if name == TURN:
             answer = payload
@@ -304,7 +374,11 @@ async def submit_turn(thread_id: str, body: TurnRequest, request: Request) -> di
     return answer
 
 
-@app.get("/threads", response_model=ThreadListResponse)
+@app.get(
+    "/threads",
+    response_model=ThreadListResponse,
+    dependencies=[Depends(customer_id)],
+)
 async def get_threads(
     request: Request, limit: int = 50, offset: int = 0
 ) -> ThreadListResponse:
@@ -319,7 +393,11 @@ async def get_threads(
     )
 
 
-@app.get("/threads/{thread_id}", response_model=ThreadResponse)
+@app.get(
+    "/threads/{thread_id}",
+    response_model=ThreadResponse,
+    dependencies=[Depends(customer_id)],
+)
 async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
     """Reopen a conversation.
 
@@ -334,7 +412,11 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
     return ThreadResponse(thread_id=thread_id, messages=_readable_messages(messages))
 
 
-@app.delete("/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/threads/{thread_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(customer_id)],
+)
 async def delete_thread(thread_id: str, request: Request) -> None:
     """Drop a conversation from the list.
 

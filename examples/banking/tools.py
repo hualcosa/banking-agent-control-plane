@@ -15,12 +15,14 @@ a tool that lets a sentence stand in for an authentication factor. So
 Results are JSON so the model relays fields rather than paraphrasing them. A
 ``status`` the model did not receive is a status it cannot truthfully claim.
 
-Identity is mocked: every session is one customer. The session is real — it is
-the thread — which is what makes a confirmation non-transferable between
-conversations.
+Identity comes from the channel, never from here. ``app.py`` verifies the
+signed identity header and puts the resolved customer in the graph's
+``configurable`` dict, next to the thread; ``context_for`` reads both from
+there. The customer is therefore something the agent is *told*, not something
+it decides — a constant in this module would be an identity a prompt could
+argue with, and the whole control plane scopes on it.
 
-# ponytail: one ControlPlane per process, one hard-coded customer. V1 injects
-# the plane per request and reads the customer from the channel's identity.
+# ponytail: one ControlPlane per process. V1 injects the plane per request.
 """
 
 from __future__ import annotations
@@ -42,16 +44,27 @@ from control_plane import (
 
 PLANE = ControlPlane()
 
-CUSTOMER_ID = "cust_123"
+#: Only for a caller with no channel at all — an in-process drive of a tool
+#: (a unit test, a REPL). Every HTTP request carries a verified customer in
+#: ``configurable`` because ``app.py`` refuses the request otherwise, so this
+#: name cannot be reached from the network: it is a fixture, not a fallback
+#: identity. Anything that makes it reachable from a request is a bug.
+DEFAULT_CUSTOMER_ID = "cust_123"
 
 
 def context_for(runtime: ToolRuntime) -> Context:
-    """The session context, from the thread the graph is running in."""
-    thread_id = (
-        (runtime.config or {}).get("configurable", {}).get("thread_id", "no-thread")
-    )
+    """Who is acting and in which conversation, both from ``configurable``.
+
+    The customer was resolved from the channel's signed identity by ``app.py``
+    and travels down here untouched; the session is the thread, which is what
+    makes a confirmation non-transferable between conversations. Neither is
+    readable or writable by the model — they are not tool arguments.
+    """
+    configurable = (runtime.config or {}).get("configurable", {})
     return Context(
-        customer_id=CUSTOMER_ID, session_id=str(thread_id), channel="whatsapp"
+        customer_id=str(configurable.get("customer_id") or DEFAULT_CUSTOMER_ID),
+        session_id=str(configurable.get("thread_id", "no-thread")),
+        channel="whatsapp",
     )
 
 
