@@ -1,0 +1,58 @@
+# Secrets. .env.example is the committed template; .env never is.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv*/
+venv/
+
+# Frontend. package-lock.json IS committed — the image builds with `npm ci`,
+# which installs the lockfile exactly and fails without one. dist/ is built
+# inside the image and by `make ui-dev`, so a committed copy could only ever be
+# a stale one somebody serves by accident.
+ui/node_modules/
+ui/dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local tooling data — machine-local, regenerated on demand, never shared.
+# `.codegraph/` is a multi-megabyte SQLite index; `.ua/` is the knowledge
+# graph, which auto-updates on commit and would churn on every one of them.
+# `.playwright-mcp/` is where a browser-driving agent drops console logs, page
+# snapshots and screenshots while debugging the UI; they are a transcript of a
+# bug that has since been fixed, and committing one would preserve a stack trace
+# from a build nobody can reproduce.
+.codegraph/
+.ua/
+.playwright-mcp/
+
+# Automated Security Helper reviews contain machine-local security findings.
+.ash/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Agent tooling — vendored skill packs, machine-local.
+.claude/
+infra-cdk/node_modules/
+infra-cdk/cdk.out/
+
+# CDK context caches the deploying account id and AZ lookups; regenerated on synth.
+infra-cdk/cdk.context.json
+
+# Local git worktrees.
+.worktrees/

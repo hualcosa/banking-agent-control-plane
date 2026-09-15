@@ -1,0 +1,45 @@
+# CI runs exactly what a contributor runs locally: `make lint`, then `make test`.
+#
+# The unit tier is offline by design — no Docker, no Postgres,
+# no API key — so this job needs nothing but Python and uv. `make test` already
+# injects the placeholder key and the host-side addresses, and already enforces
+# `--cov` with `fail_under=90`; repeating any of that here would let CI and the
+# local command drift apart. The integration tier stays behind its marker and
+# never runs in this workflow.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same ref cancels the run still in flight for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      # Pin third-party actions to immutable commits. The comments retain the
+      # human-readable release that each reviewed SHA represents.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # `requires-python = ">=3.12"` in pyproject.toml; setup-uv provisions the
+      # interpreter itself, so no separate setup-python step.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests with coverage
+        run: make test

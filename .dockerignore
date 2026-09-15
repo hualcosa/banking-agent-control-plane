@@ -1,0 +1,65 @@
+# Build context for the shared image. The Dockerfile copies pyproject.toml,
+# src/, examples/, and the two documents the guide example reads — so
+# everything else is context transfer with no build output.
+
+# Secrets. The API key is supplied at run time via env_file, never baked in.
+.env
+.env.*
+!.env.example
+
+# Version control and tooling metadata
+.git
+.gitignore
+.dockerignore
+.github
+.vscode
+.idea
+
+# Python build and cache artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Not needed to build or run the image. `db/` is *not* in this list: the
+# postgres container reads `db/schema.sql` as its init hook, and so does
+# `trail.evals.store`, which applies the same file to create the two eval
+# tables on a volume that predates the harness. One DDL definition, two
+# readers, and the second one lives inside this image.
+research/
+tests/
+docs/
+
+# The frontend. It builds from its own context (./ui) with its own Dockerfile
+# and never enters the Python image, so `ui/` alone is enough — the two paths
+# after it are spelled out anyway, because they are the ones that hurt if a
+# later edit narrows this rule: a populated node_modules is tens of thousands
+# of files and hundreds of megabytes of context transfer for a build that would
+# not read one byte of it, and dist/ is build output masquerading as source.
+ui/
+ui/node_modules/
+ui/dist/
+
+Makefile
+docker-compose.*.yml
+Dockerfile
+
+# Root-level markdown only. Docker matches a bare `*.md` against single path
+# components, so this leaves nested files alone.
+#
+# The two re-includes are not tidying. The guide example answers *from* the
+# README and reads the service list out of the compose file, and it derives the
+# set of real identifiers from both — which is what its output guardrail checks
+# an answer against. Excluded, the agent still boots, still looks healthy, and
+# answers every question with "not documented".
+*.md
+!README.md
+!docker-compose.yml

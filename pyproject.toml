@@ -1,0 +1,194 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trail"
+version = "1.0.0"
+description = "TRAIL — Traced Runtime for Agents, Instrumented Locally. A generic LLM+tools agent runtime with pluggable input/output guardrails and an observable pipeline."
+requires-python = ">=3.12"
+
+# Floors here, exact versions in uv.lock. The floors say what the code needs,
+# and the lock file says what was actually resolved, tested and built into the
+# image. The Dockerfile syncs with `--locked`, so a lock that has drifted from
+# this file fails the build instead of silently shipping a different
+# resolution. That is the same argument the repo makes about pinning model
+# versions, one layer down.
+dependencies = [
+    "fastapi>=0.141",
+    "uvicorn[standard]>=0.52",
+    "pydantic>=2.13",
+    "pydantic-settings>=2.15",
+    "psycopg[binary,pool]>=3.3",
+    "httpx>=0.28",
+    # Cognito JWTs (TRAIL_IDENTITY_MODE=jwt). `[crypto]` brings `cryptography`, which RS256
+    # verification needs; the unit tier signs its own tokens with it too.
+    "PyJWT[crypto]>=2.10",
+    "rich>=15.0",
+    # The agent itself. `create_agent` lives in `langchain`, not `langgraph` —
+    # v1 moved the prebuilt agent out of `langgraph.prebuilt` and made it the
+    # main surface of `langchain`, with the middleware system that `before_agent`
+    # / `after_agent` guardrails hang off. It returns a LangGraph graph.
+    "langchain>=1.0",
+    # `langchain` pulls `langgraph` transitively, but this repo imports from it
+    # directly — `Runtime`, `get_stream_writer`, the savers and the stores — and
+    # a dependency you import is a dependency you declare.
+    "langgraph>=1.0",
+    # Durable threads. `InMemorySaver` ships with langgraph and loses every
+    # conversation on restart; this is the checkpointer and the cross-thread
+    # store that make `TRAIL_CHECKPOINTER=postgres` mean something.
+    "langgraph-checkpoint-postgres>=2.0",
+    # The provider binding for `init_chat_model("openai:...")`. `TRAIL_LLM_BASE_URL`
+    # reaches `ChatOpenAI(base_url=...)` through it, so any OpenAI-compatible
+    # endpoint works without a second integration package.
+    "langchain-openai>=1.0",
+    # No YAML or front-matter library: `trail.protocol` needs one scalar out of
+    # the protocol file's front matter and reads it with a regex, so a
+    # dependency here would be resolved, locked and shipped into the runtime
+    # image to earn nothing. See the comment at protocol.py's `_FRONT_MATTER_RE`.
+    "opentelemetry-sdk>=1.44",
+    "opentelemetry-exporter-otlp>=1.44",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-httpx>=0.65b0",
+]
+
+[project.optional-dependencies]
+# `TRAIL_LLM_PROVIDER=bedrock_converse` needs LangChain's AWS integration, which
+# drags boto3 in behind it. An extra rather than a default dependency: an
+# OpenAI-compatible deployment — which is every one this repo ships — should not
+# pay for the AWS SDK in its image. Install with `uv sync --extra bedrock`.
+bedrock = [
+    "langchain-aws>=1.0",
+]
+# Everything the AWS image needs on top of the default install: the Bedrock
+# binding, the SDK the secret loader imports, and the ADOT distro that puts
+# spans in CloudWatch when `opentelemetry-instrument` wraps the process.
+# `uv sync --extra aws`; the Dockerfile takes it as UV_EXTRAS="--extra aws".
+aws = [
+    "langchain-aws>=1.0",
+    "boto3>=1.35",
+    "aws-opentelemetry-distro>=0.18.0",
+]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "pytest-cov>=7",
+    "ruff>=0.16",
+    # The provider seam is asserted offline in the unit tier, so the Bedrock
+    # binding has to be importable there even though it is optional at runtime.
+    "langchain-aws>=1.0",
+]
+
+[project.scripts]
+# `chat` and `eval` speak HTTP to the agent, exactly as any client would.
+# `step-up`, `intents` and `reconcile` deliberately do not: they open the
+# shared Postgres and build their own control plane, because an out-of-band
+# channel that goes through the agent's own API is not out of band, and an
+# operator resolving an UNKNOWN intent usually needs to work while the agent
+# is the thing that is down.
+trail = "trail.cli:main"
+
+[tool.hatch.build.targets.wheel]
+# `examples` ships in the image: the demo agent is mounted by name at runtime
+# (TRAIL_AGENT), so it has to be importable from an installed wheel, not just
+# from a source checkout.
+packages = ["src/trail", "src/control_plane", "examples"]
+
+
+# ---------------------------------------------------------------------------
+# Ruff — formatter and linter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+# Ruff skips `.venv` by default but not the ad-hoc virtualenvs that collect in
+# a repo root. Nothing under one of them is this project's source.
+#
+# Markdown is excluded because `ruff format` reformats fenced Python blocks
+# inside it, and the signature tables in INTERFACES.md are column-aligned on
+# purpose — that document is read as a contract, not executed, and the
+# alignment is what makes it scannable. Excluding it is the choice; the
+# alternative is letting the formatter rewrite documentation to match code
+# style it will never run.
+extend-exclude = [".venv*", "*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade — the floor is 3.12, so write 3.12
+    "SIM",  # simplifications
+    "C4",   # comprehensions
+    "RUF",  # ruff-specific
+]
+ignore = [
+    # `ruff format` owns line length. E501 only ever fires on the lines the
+    # formatter cannot split — long string literals — and failing lint on a
+    # line no tool can fix is noise, not rigour.
+    "E501",
+    # Docstrings and the approved Portuguese text in this repo use en dashes, em
+    # dashes, typographic quotes and accented characters on purpose. They are
+    # not accidental homoglyphs.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # `datetime.now(timezone.utc)` over `datetime.now(datetime.UTC)`. Both are
+    # correct; INTERFACES §1 fixes the spelling for every module in the repo,
+    # and a linter that argues with the interface contract is the linter that
+    # is wrong.
+    "UP017",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["trail", "control_plane", "examples", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on values; a bare comparison in a test is the assertion, and
+# fixtures legitimately shadow builtins less carefully than library code.
+"tests/**" = ["B008"]
+
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+
+# Two tiers, and the split is deliberate: unit tests must run
+# on a laptop with no Docker, no Postgres, no network and no API key, so they
+# stay runnable in review. Everything that needs the compose stack is behind
+# the `integration` marker and never runs by accident.
+markers = [
+    "unit: offline and pure — no network, no database, no API key",
+    "integration: requires the compose stack; run with `make test-integration`",
+    "matrix: the invariant matrix, N seeded trials per cell; run with `make matrix`",
+]
+
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+# Measured by `make test`, over the unit tier only: that is the tier that runs
+# everywhere, so it is the only one a threshold can be enforced on. The
+# integration tier adds coverage but only where a stack and a real key exist.
+[tool.coverage.run]
+source = ["trail", "control_plane"]
+# Every line in pgstore.py needs a database to execute, so it is covered by the
+# integration tier and invisible to the unit one. Omitted in the same commit
+# that created it: a 90% gate that has to be argued with on the day a file
+# lands is a gate the next person learns to lower instead of meet.
+omit = ["*/control_plane/pgstore.py", "*/control_plane/pgbank.py"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true

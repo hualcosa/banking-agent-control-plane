@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Both values, and that is what makes `light-dark()` in styles.css work at
+      all: with a single value every token resolves to that side regardless of
+      what the reader asked for.
+    -->
+    <meta name="color-scheme" content="light dark" />
+    <title>Banking Agent Control Plane · TRAIL</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!--
+      Two families, three jobs. Manrope carries every word; IBM Plex Mono carries
+      every machine value — milliseconds, tokens, cost, identifiers — because
+      those need tabular figures, and a column of numbers that shifts as the
+      digits change is a column nobody can read at a glance.
+    -->
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
+    />
+    <!--
+      Last in <head>, before the stylesheet is applied, and the try/catch is not
+      decoration: Safari's private mode throws on localStorage rather than
+      returning null.
+
+      This exists only for a reader who overrode their system preference. One
+      who has not never reaches it — `light-dark()` paints the correct theme on
+      the very first frame with no JavaScript at all. Without it, that minority
+      gets a flash of the wrong theme on every load.
+    -->
+    <script>
+      try {
+        var t = localStorage.getItem("trail.theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.dataset.theme = t;
+        }
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

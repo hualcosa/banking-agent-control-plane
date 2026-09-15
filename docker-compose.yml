@@ -1,0 +1,419 @@
+# TRAIL — local stack.
+#
+# `agent`, `ui`, `postgres` and the six-container Langfuse stack are the
+# system; `client` is how a human drives it. `make up` brings up the system,
+# `make chat` runs the client on demand.
+#
+# The `client` boundary is the argument, not an accident of packaging: it
+# speaks the same HTTP a browser speaks, so nothing it demonstrates depends on
+# a code path a real caller does not have.
+
+name: trail
+
+# The image is built once and shared by agent and client. Compose
+# deduplicates identical build+image pairs, so this anchor is one build.
+x-trail-image: &trail-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: trail:local
+
+# Every TRAIL_ variable that names another container is indirected through an
+# environment variable with a compose default. The OTLP endpoint especially:
+# the reason OpenTelemetry was chosen over a vendor SDK is that moving to
+# Tempo, X-Ray or Datadog has to be configuration rather than code
+#, and that claim is only true if nothing hardcodes Langfuse.
+x-trail-env: &trail-env
+  TRAIL_DATABASE_URL: ${TRAIL_DATABASE_URL:-postgresql://trail@postgres:5432/trail}
+  # libpq consumes the password separately, keeping credentials out of URLs
+  # that may be copied into logs and exception messages.
+  PGPASSWORD: ${POSTGRES_PASSWORD:-trail}
+  TRAIL_AGENT_BASE_URL: ${TRAIL_AGENT_BASE_URL:-http://agent:8080}
+  TRAIL_OTEL_EXPORTER_OTLP_ENDPOINT: ${TRAIL_OTEL_EXPORTER_OTLP_ENDPOINT:-http://langfuse-web:3000/api/public/otel/v1/traces}
+  # HTTP Basic over the project's API key pair. Langfuse does not accept OTLP
+  # over gRPC at all, so this is HTTP/protobuf and the header is not optional.
+  # The base64 is b64("pk-lf-trail-demo:sk-lf-trail-demo"); regenerate with
+  #   printf 'PUBLIC:SECRET' | base64 -w 0
+  # if you change the demo keys below, or ingestion 401s in a background
+  # thread and the trace list stays empty with nothing in the agent's log.
+  TRAIL_OTEL_EXPORTER_OTLP_HEADERS: ${TRAIL_OTEL_EXPORTER_OTLP_HEADERS:-Authorization=Basic cGstbGYtdHJhaWwtZGVtbzpzay1sZi10cmFpbC1kZW1v,x-langfuse-ingestion-version=4}
+  # The three dials. Defaults are the safe ones: both gates on, and state in
+  # memory so a first `make up` needs no schema and loses nothing that matters.
+  TRAIL_AGENT: ${TRAIL_AGENT:-banking}
+  TRAIL_GUARDRAILS: ${TRAIL_GUARDRAILS:-both}
+  TRAIL_CHECKPOINTER: ${TRAIL_CHECKPOINTER:-postgres}
+  # The control plane's own state — intents and the ledger — on the same
+  # Postgres. Separate from TRAIL_CHECKPOINTER because they are different data
+  # with different owners: LangGraph owns the conversation, this owns money.
+  # `postgres` here is what makes `trail intents` and `trail reconcile` read
+  # the state the agent actually wrote; on `memory` they would open a database
+  # nobody writes to and report that a real payment never happened.
+  TRAIL_CONTROL_PLANE_STORE: ${TRAIL_CONTROL_PLANE_STORE:-postgres}
+  # The one address here that is deliberately NOT a container name. The agent
+  # stamps a Langfuse deep link onto every response so the UI can offer "see
+  # the trace", and that link is resolved by a browser on the host, not by a
+  # container on this network. `http://langfuse-web:3000` would be correct for
+  # the OTLP endpoint above and dead on arrival in an address bar, so this
+  # points at the port langfuse-web publishes.
+  TRAIL_LANGFUSE_UI_BASE_URL: ${TRAIL_LANGFUSE_UI_BASE_URL:-http://localhost:${LANGFUSE_WEB_PORT:-3000}}
+  # Langfuse scopes every trace URL by project; this is the fixed demo project
+  # id provisioned headlessly below (LANGFUSE_INIT_PROJECT_ID). Change one,
+  # change both.
+  TRAIL_LANGFUSE_PROJECT_ID: ${TRAIL_LANGFUSE_PROJECT_ID:-trail}
+
+services:
+  # -------------------------------------------------------------------------
+  # postgres — call records, semantic traces, eval results.
+  #
+  # db/schema.sql is applied by the image's init hook on an empty data volume.
+  # There is no migration tool, on purpose: five tables do
+  # not need Alembic, and migrations are a production concern the repo cannot
+  # honestly exercise. `make clean` drops the volume and re-applies.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trail}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trail}
+      POSTGRES_DB: ${POSTGRES_DB:-trail}
+      # Local-only stack; no TLS, no external exposure beyond the published
+      # port. Real deployments get RDS/Aurora and a secret manager.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports:
+      # Published so host-run integration tests and `psql` can reach it.
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      # `agent` gates on this: connecting before the init script
+      # finishes gives a database with no tables, which fails much later and
+      # much less legibly than not starting.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trail} -d ${POSTGRES_DB:-trail}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # agent — the conversation service.
+  #
+  # Stateless in process: conversation state lives in the checkpointer, so a
+  # thread survives a restart when TRAIL_CHECKPOINTER=postgres and does not
+  # when it is `memory`. Which of those is true is a one-line setting and is
+  # reported in the startup log rather than left to be discovered.
+  # -------------------------------------------------------------------------
+  agent:
+    <<: *trail-image
+    env_file:
+      # Optional so `make down`, `make logs` and `make clean` still work on a
+      # checkout with no .env. The targets that actually need credentials
+      # depend on the file in the Makefile and say so.
+      - path: .env
+        required: false
+    environment:
+      <<: *trail-env
+      TRAIL_SERVICE_NAME: trail-agent
+    ports:
+      - "${AGENT_PORT:-8000}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_started
+    healthcheck:
+      # httpx is already a dependency, so the check costs no image weight.
+      # `curl` would mean an apt layer in a slim image to run one GET.
+      test:
+        - CMD
+        - python
+        - -c
+        - import httpx; httpx.get('http://localhost:8080/healthz').raise_for_status()
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # ui — the demo surface: the browser view of a call, one turn at a time.
+  #
+  # nginx serving a built Vite bundle, and also reverse-proxying /api/ to the
+  # agent. That second job is the design: the app and the API share an origin,
+  # so there is no CORS middleware anywhere in this repo — no preflight, no
+  # Access-Control-Allow-Origin, and no permissive header invented for a demo
+  # and then inherited by something real. The browser only ever calls relative
+  # paths, which is also why the Vite dev server can stand in for this service
+  # unchanged (`make ui-dev`).
+  #
+  # The Langfuse "see the trace" link is the exception, and deliberately so:
+  # it is an absolute URL the agent supplies, pointing at the port
+  # langfuse-web publishes on the host. The browser resolves it directly and
+  # never touches this proxy, because it is the laptop that opens the link,
+  # not the container — see TRAIL_LANGFUSE_UI_BASE_URL above.
+  # -------------------------------------------------------------------------
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    image: trail-ui:local
+    ports:
+      - "${UI_PORT:-5173}:8080"
+    depends_on:
+      # Healthy, not merely started. nginx resolves `agent` once at startup for
+      # a proxy_pass target and caches the result, so coming up before the
+      # agent has a DNS entry leaves the proxy answering 502 until it is
+      # restarted — a failure that looks like a broken frontend.
+      agent:
+        condition: service_healthy
+    healthcheck:
+      # busybox wget ships in the nginx image; there is no curl and adding one
+      # would mean an apk layer to run a single GET. 127.0.0.1, not localhost:
+      # our default.conf only `listen 8080` (v4), and the image's
+      # 10-listen-on-ipv6-by-default.sh skips a customised conf, so busybox
+      # wget resolving localhost to ::1 gets ECONNREFUSED.
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # client — the CLI, and the seam where telephony and audio attach later
+  #. Not a long-running service: it sits behind a profile so
+  # `docker compose up` ignores it, and runs on demand via
+  # `docker compose run --rm client ...` (`make chat`, `make eval`).
+  # -------------------------------------------------------------------------
+  client:
+    <<: *trail-image
+    profiles: ["cli"]
+    env_file:
+      # Optional so `make down`, `make logs` and `make clean` still work on a
+      # checkout with no .env. The targets that actually need credentials
+      # depend on the file in the Makefile and say so.
+      - path: .env
+        required: false
+    environment:
+      <<: *trail-env
+      TRAIL_SERVICE_NAME: trail-client
+    depends_on:
+      agent:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command: ["trail", "--help"]
+
+  # ===========================================================================
+  # Langfuse v4, self-hosted — the OTLP collector and trace UI. Six containers,
+  # because LLM observability is a different shape of problem from request
+  # tracing (README §4): a generation carries a model, a token count and a
+  # cost, none of which a span-only backend like Jaeger types natively.
+  #
+  # "Self-hosted Langfuse is v3" is an out-of-date belief — v4 went GA for
+  # self-hosting on 2026-08-17, and the deltas below are copied from the
+  # canonical main-branch compose file, not a v3 tutorial.
+  #
+  # Every interpolation variable below is LANGFUSE_-prefixed, deliberately not
+  # the bare ${POSTGRES_USER}-style names upstream uses: this repo's .env
+  # already sets POSTGRES_USER/PASSWORD/DB to `trail` for the *other*
+  # postgres service, and compose interpolates .env across the whole file.
+  # Reusing the bare names would create Langfuse's database as user `trail`
+  # while its DATABASE_URL still says postgres:postgres, and the stack would
+  # die on an auth error appearing in no upstream doc.
+  # ===========================================================================
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    restart: always
+    # Ingestion in v4 is asynchronous: langfuse-web parks the OTLP payload in
+    # S3/Redis and this worker is what drains the BullMQ queue into
+    # ClickHouse. Omit it and the stack accepts spans with a 2xx and then shows
+    # an empty trace list forever — the worst failure mode for a demo.
+    depends_on: &langfuse-depends-on
+      langfuse-postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    # Upstream publishes 127.0.0.1:3030 for its own convenience; nothing in
+    # this repo talks to the worker directly, so it stays unpublished.
+    environment: &langfuse-worker-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:${LANGFUSE_WEB_PORT:-3000}}
+      DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER:-postgres}:${LANGFUSE_POSTGRES_PASSWORD:-postgres}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB:-postgres}
+      SALT: ${SALT:-mysalt}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      # This is a local demo of an observability stack; phoning home to
+      # Langfuse's own telemetry endpoint is not part of the demo.
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      # Upstream overrides this to http://localhost:9090 on langfuse-web so a
+      # browser can fetch presigned media URLs. minio's 9090 is deliberately
+      # unpublished below (this demo emits no media), so both worker and web
+      # point at the in-network address instead — see the risk note in
+      # BUILD_REPORT.md / the plan this stack was built from.
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
+      REDIS_TLS_ENABLED: "false"
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    restart: always
+    depends_on: *langfuse-depends-on
+    ports:
+      # The OTLP ingestion endpoint (/api/public/otel/v1/traces), the public
+      # API the smoke tests poll, and the UI the deep link opens. The only
+      # Langfuse port this stack publishes.
+      - "${LANGFUSE_WEB_PORT:-3000}:3000"
+    environment:
+      <<: *langfuse-worker-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret}
+      # Langfuse v4 OSS has no unauthenticated mode — the only auth switches in
+      # the build are DISABLE_SIGNUP and DISABLE_USERNAME_PASSWORD, and the
+      # second forces SSO, which is worse. So the login cannot be removed; it
+      # can only be made to happen once.
+      #
+      # Minutes. The default of 20160 is 14 days, which on a demo you return to
+      # every few weeks means being logged out exactly when you had forgotten
+      # there was a login — and an expired session answers a trace URL with a
+      # permanent "Loading…" and a console of 401s rather than a sign-in page.
+      # A year turns that into a one-time cost per machine.
+      AUTH_SESSION_MAX_AGE: ${AUTH_SESSION_MAX_AGE:-525600}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      # Headless provisioning: org, project, API key pair and admin user are
+      # created on first boot with no signup form to click through. Values are
+      # fixed demo constants (.env.example explains why); the config.py
+      # default endpoint and TRAIL_LANGFUSE_PROJECT_ID above have to agree
+      # with LANGFUSE_INIT_PROJECT_ID / _PUBLIC_KEY / _SECRET_KEY here.
+      # Deliberately unquoted — Langfuse's docs warn that double-quoting these
+      # breaks headless provisioning.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+    # No healthcheck: upstream deliberately defines none for this image (no
+    # guaranteed wget/curl to build one from), so `make up --wait` returns
+    # before this serves traffic. The Makefile polls /api/public/health itself
+    # instead of gating compose on a check that doesn't exist.
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    restart: always
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    # Unpublished: only langfuse-web/worker on this compose network query it,
+    # and an unpublished port cannot collide with anything else on the host.
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    restart: always
+    entrypoint: sh
+    # Create the 'langfuse' bucket before starting the service.
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    # Unpublished, unlike upstream's 9090/9091. This demo emits no media, so
+    # browser-side presigned-URL preview is dead — the one-line undo is
+    # republishing 9090 and pointing LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT at
+    # http://localhost:9090 on langfuse-web again.
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  redis:
+    image: docker.io/redis:7
+    restart: always
+    command: >
+      --requirepass ${REDIS_AUTH:-myredissecret}
+      --maxmemory-policy noeviction
+    # Unpublished: nothing outside this compose network needs BullMQ or the
+    # cache, and the host has nothing on 6379 today anyway — no reason to add
+    # a collision surface for a second stack.
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  # A second, dedicated Postgres — not the repo's own `postgres` service.
+  # Reusing it would mean Langfuse's ~50-table Prisma schema landing in the
+  # same database INTERFACES.md §8 calls "five tables, no migration tool",
+  # `make clean` silently destroying Langfuse's org/project/API keys along
+  # with call records, and a version mismatch (repo pins postgres:16-alpine,
+  # Langfuse v4 targets 17). The cost of a second container is ~50MB; the cost
+  # of sharing is a confusing, unrecoverable data loss mid-demo.
+  langfuse-postgres:
+    image: docker.io/postgres:17
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    environment:
+      POSTGRES_USER: ${LANGFUSE_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LANGFUSE_POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    # Unpublished: upstream's own compose publishes this on 127.0.0.1:5432,
+    # which the repo's `postgres` service already owns on the host. Not
+    # publishing Langfuse's Postgres at all is what lets the two coexist.
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
+  # Named, not bind-mounted — ClickHouse runs as uid 101 and a host bind mount
+  # is the classic first-boot permission failure.
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

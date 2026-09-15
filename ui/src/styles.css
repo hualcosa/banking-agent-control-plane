@@ -1,0 +1,958 @@
+/* ==========================================================================
+   Banking Agent Control Plane — the browser surface.
+
+   One hand-written stylesheet, no framework. The palette now belongs to a
+   financial control surface: mineral greens for authority, blue for traces,
+   amber for tools. The conversation stays familiar so attention can move to
+   the part that is unusual.
+
+   The unusual part is the rail under each answer. Everything above it is a
+   conversation; the rail is the claim that you can see what the machine did.
+
+   Three rules run through the whole file:
+
+   - `light-dark()` for every colour, so a token is one line and the two themes
+     cannot drift apart.
+   - `blocked` and `skip` never rely on colour alone. Colour is lost in a
+     screenshot and to a reader who cannot distinguish red from grey, and those
+     two states are the ones worth seeing.
+   - No fixed heights on anything holding model output. The agent answers with
+     80-column ASCII diagrams, and they scroll inside their own box rather than
+     making the page scroll sideways.
+   ========================================================================== */
+
+:root {
+  /* Both values, so `light-dark()` resolves against the reader's choice.
+     The `[data-theme]` rules below are how an explicit override wins. */
+  color-scheme: light dark;
+
+  /* --- ground ---------------------------------------------------------- */
+  --bg:            light-dark(#f4f7f5, #08120f);
+  --surface:       light-dark(#ffffff, #0d1915);
+  --surface-2:     light-dark(#e8f0ec, #14251f);
+
+  /* --- ink ------------------------------------------------------------- */
+  --text:          light-dark(#10231c, #e5f2ec);
+  --muted:         light-dark(#50645b, #9bada5);
+
+  /* --- lines ------------------------------------------------------------
+     Two, and the split is a contrast requirement rather than taste. `--border`
+     is 1.39:1 in light — invisible as a control boundary, correct as a
+     separator. Anything a reader is meant to aim at uses `--border-strong`,
+     which clears the 3:1 that non-text contrast asks for: 4.23 in light and
+     4.00 in dark, measured against the surfaces they actually sit on. The dark
+     value started at #6b5ca5, which measured 3.05 — passing, and passing by so
+     little that any later tweak to the surface would break it silently. */
+  --border:        light-dark(#d5dfda, #20352d);
+  --border-strong: light-dark(#779488, #668a7b);
+
+  /* --- brand ------------------------------------------------------------ */
+  --primary:       light-dark(#0f6b4f, #4fe0a4);
+  --on-primary:    light-dark(#ffffff, #062117);
+  --primary-soft:  light-dark(#dff2ea, #12382b);
+
+  /* --- accent -----------------------------------------------------------
+     Cyan-700 in light, not the cyan-600 that reads brighter: #0891b2 measures
+     3.68:1 on the page ground and fails as text. */
+  --accent:        light-dark(#155eb8, #7db3ff);
+
+  /* --- tool -------------------------------------------------------------
+     A third hue, so the rail's three kinds — gate, model, tool — are
+     distinguishable without reading. Amber-800/amber-400: 4.68:1 light and
+     11.20:1 dark. Colour is never the only carrier here (the labels differ
+     too), but it is what lets the eye separate the guardrail cost from the
+     model flow at a glance, which is the whole reason the rail is one line. */
+  --tool:          light-dark(#9a4b08, #f2b45f);
+
+  /* --- alert ------------------------------------------------------------ */
+  --danger:        light-dark(#b91c1c, #f87171);
+  --danger-soft:   light-dark(#fef2f2, #2d1618);
+
+  --ring:          light-dark(#0f6b4f, #4fe0a4);
+
+  /* --- type ------------------------------------------------------------- */
+  --sans: "Manrope", ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* --- space (4px base) -------------------------------------------------- */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 24px; --s-6: 32px; --s-7: 48px;
+
+  --r-sm: 6px; --r-md: 10px; --r-lg: 16px; --r-full: 999px;
+
+  --dur-fast: 120ms; --dur: 180ms;
+  --ease: cubic-bezier(0.2, 0.9, 0.3, 1);
+
+  /* Roughly 68 characters at this size — inside the 60–75 that long-form text
+     is read most easily at. */
+  --thread-w: 48rem;
+  --scenario-w: 66rem;
+  --sidebar-w: 16rem;
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"]  { color-scheme: dark; }
+
+*, *::before, *::after { box-sizing: border-box; }
+
+/* `dvh` and not `%` or `vh`. Both of those resolve against a viewport that can
+   be taller than what is on screen — a browser window dragged past the bottom
+   edge of the display, or a mobile browser counting the space its own URL bar
+   occupies. The composer is pinned to the bottom of this box, so when the box
+   is taller than the screen the composer is simply not there, and the app looks
+   broken in a way no amount of scrolling fixes. */
+html, body, #root {
+  height: 100dvh;
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: var(--primary); color: var(--on-primary); }
+
+/* --- shared voices ------------------------------------------------------ */
+
+.mono {
+  font-family: var(--mono);
+  /* Tabular figures, and the reason is the rail: a column of millisecond
+     counts that reflows as the digits change is a column nobody can scan. */
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8125rem;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Never `outline: none`. Every interactive element keeps a visible ring. */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* --- shell -------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 1fr;
+  height: 100%;
+}
+
+.shell--with-sidebar { grid-template-columns: var(--sidebar-w) 1fr; }
+
+.shell__sidebar {
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.shell__main {
+  display: grid;
+  /* header · transcript · composer. `minmax(0, 1fr)` and not `1fr`: without
+     the zero floor a long answer makes the grid row grow instead of the
+     transcript scrolling, and the composer walks off the bottom. */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Below the breakpoint the sidebar overlays instead of splitting the width;
+   at 15rem of a 375px screen there is nothing left for the conversation. */
+@media (max-width: 1023px) {
+  .shell--with-sidebar { grid-template-columns: 1fr; }
+  .shell__sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(20rem, 85vw);
+    z-index: 20;
+    box-shadow: 12px 0 32px rgb(0 0 0 / 0.2);
+  }
+
+  .shell__backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 19;
+    padding: 0;
+    border: 0;
+    background: rgb(0 0 0 / 0.42);
+    cursor: pointer;
+  }
+}
+
+/* --- topbar -------------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  backdrop-filter: blur(14px);
+}
+
+.topbar__title {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+
+.topbar__title small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.topbar__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin: 0 auto 0 var(--s-2);
+  color: var(--muted);
+}
+
+.topbar__field {
+  padding: 2px var(--s-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  white-space: nowrap;
+}
+
+/* The dial reads as the product's own state, so it is tinted rather than
+   neutral — and when it is off it says so in the alert colour, because a
+   screenshot of a conversation with the gates down should be unmistakable. */
+.topbar__field--dial {
+  color: var(--primary);
+  border-color: var(--border-strong);
+  background: var(--primary-soft);
+}
+
+.topbar__field--dial.is-off {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 36px, over the 24 CSS px that pointer targets are asked to clear. */
+  width: 36px; height: 36px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.iconbtn:hover { background: var(--surface-2); color: var(--text); }
+
+/* --- sidebar ------------------------------------------------------------- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  padding: var(--s-3);
+}
+
+.sidebar__actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--s-2);
+}
+
+.sidebar__close {
+  width: 44px;
+  height: 44px;
+  border-color: var(--border);
+  font-size: 1.25rem;
+}
+
+.sidebar__new {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.sidebar__new:hover { background: var(--surface-2); }
+
+.sidebar__list {
+  list-style: none;
+  margin: var(--s-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar__item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-radius: var(--r-md);
+}
+
+.sidebar__item:hover { background: var(--surface-2); }
+
+.sidebar__link {
+  min-width: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.875rem;
+  text-align: left;
+  cursor: pointer;
+  /* One line, ellipsised. A sidebar row that wraps to three lines turns the
+     list into a wall and stops being scannable, which is its whole job. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar__link.is-active { color: var(--primary); font-weight: 600; }
+
+.sidebar__forget {
+  /* Hidden until the row is hovered or the button itself is focused — the
+     `:focus-within` is what keeps it reachable by keyboard, which
+     `display: none` on hover-only would not. */
+  opacity: 0;
+  width: 28px; height: 28px;
+  margin-right: var(--s-1);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+.sidebar__item:hover .sidebar__forget,
+.sidebar__item:focus-within .sidebar__forget { opacity: 1; }
+
+.sidebar__forget:hover { color: var(--danger); }
+
+.sidebar__empty,
+.sidebar__note {
+  margin: var(--s-3) 0 0;
+  padding: 0 var(--s-2);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.sidebar__note {
+  margin-top: auto;
+  padding-top: var(--s-3);
+  border-top: 1px solid var(--border);
+}
+
+/* --- transcript ---------------------------------------------------------- */
+
+.transcript {
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+  min-width: 0;
+  padding: var(--s-6) var(--s-4);
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.transcript__flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-6);
+  width: 100%;
+  max-width: var(--thread-w);
+  min-width: 0;
+  margin: 0 auto;
+}
+
+/* --- guided scenario lab -------------------------------------------------
+   The opening state demonstrates the product with factual prompts from the
+   mock. A quiet solid field keeps the hierarchy in the scenarios themselves. */
+
+.scenarios {
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  max-width: var(--scenario-w);
+  margin: 0 auto var(--s-7);
+  padding: clamp(24px, 4vw, 52px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: 0 18px 48px color-mix(in srgb, var(--text) 10%, transparent);
+  min-width: 0;
+}
+
+.scenarios::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(110deg, var(--surface) 30%, transparent 78%);
+}
+
+.scenarios__intro {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--s-6);
+  margin-bottom: var(--s-6);
+  min-width: 0;
+}
+
+.scenarios__intro > * { min-width: 0; }
+
+.scenarios__intro h2 {
+  max-width: 11ch;
+  margin: 0;
+  font-size: clamp(2.35rem, 6vw, 4.7rem);
+  font-weight: 800;
+  line-height: 0.96;
+  letter-spacing: -0.04em;
+  text-wrap: balance;
+}
+
+.scenarios__intro p {
+  max-width: 52ch;
+  margin: var(--s-4) 0 0;
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.control-map {
+  display: flex;
+  align-items: center;
+  min-width: 19rem;
+  padding: var(--s-3);
+  background: var(--bg);
+  border-radius: var(--r-md);
+}
+
+.control-map span {
+  display: grid;
+  gap: 1px;
+  min-width: 4.25rem;
+}
+
+.control-map b {
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.control-map small {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.625rem;
+}
+
+.control-map i {
+  position: relative;
+  flex: 1;
+  height: 1px;
+  margin: 0 var(--s-2);
+  background: var(--border-strong);
+}
+
+.control-map i::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  right: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+
+.scenarios__primary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-3);
+}
+
+.scenario {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--s-3);
+  min-height: 44px;
+  padding: var(--s-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
+}
+
+.scenario--featured {
+  grid-row: span 2;
+  align-content: center;
+  min-height: 15.5rem;
+  padding: clamp(20px, 3vw, 34px);
+  background: var(--primary-soft);
+  border-color: var(--border-strong);
+}
+
+.scenario:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+  transform: translateY(-2px);
+}
+
+.scenario--featured:hover { background: var(--primary-soft); }
+
+.scenario__signal {
+  width: 9px;
+  height: 9px;
+  margin-top: 0.35rem;
+  border-radius: 50%;
+  background: var(--primary);
+}
+
+.scenario[data-tone="read"] .scenario__signal { background: var(--accent); }
+.scenario[data-tone="risk"] .scenario__signal { background: var(--tool); }
+.scenario[data-tone="guard"] .scenario__signal { background: var(--danger); }
+
+.scenario--featured .scenario__signal {
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 35%, transparent);
+  animation: scenario-pulse 2.4s var(--ease) infinite;
+}
+
+.scenario__body {
+  display: grid;
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+.scenario__body strong {
+  font-size: 1rem;
+  line-height: 1.25;
+  letter-spacing: -0.015em;
+}
+
+.scenario--featured .scenario__body strong {
+  max-width: 16ch;
+  font-size: clamp(1.35rem, 2.2vw, 2rem);
+  line-height: 1.08;
+}
+
+.scenario__prompt {
+  color: var(--text);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.scenario__proof,
+.scenario__follow {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.scenario__follow { color: var(--primary); font-weight: 600; }
+
+.scenario__arrow {
+  align-self: end;
+  color: var(--primary);
+  transition: transform var(--dur) var(--ease);
+}
+
+.scenario:hover .scenario__arrow { transform: translateX(4px); }
+
+.scenarios__more {
+  margin-top: var(--s-4);
+  border-top: 1px solid var(--border);
+}
+
+.scenarios__more summary {
+  min-height: 44px;
+  padding: var(--s-3) 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.scenarios__rows .scenario {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+}
+
+.scenarios__rows .scenario:hover {
+  background: var(--surface-2);
+  transform: none;
+}
+
+.scenarios__foot {
+  margin: var(--s-4) 0 0;
+  color: var(--muted);
+  font-size: 0.6875rem;
+}
+
+@keyframes scenario-pulse {
+  60%, 100% { box-shadow: 0 0 0 13px transparent; }
+}
+
+/* --- messages ------------------------------------------------------------
+   Asymmetric on purpose: the user is bubbled, the agent is not. An unbubbled
+   agent reads as the system's output surface rather than as another person's
+   turn, which is what it is. */
+
+.msg { min-width: 0; }
+
+.msg--user { display: flex; justify-content: flex-end; }
+
+.msg__bubble {
+  max-width: 80%;
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--r-lg) var(--r-lg) var(--r-sm) var(--r-lg);
+  background: var(--surface-2);
+  overflow-wrap: anywhere;
+}
+
+.msg__who {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin: 0 0 var(--s-2);
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.msg__mark {
+  width: 14px; height: 14px;
+  border-radius: 3px;
+  background: var(--primary);
+}
+
+.msg--blocked .msg__mark { background: var(--danger); }
+.msg--blocked .msg__who { color: var(--danger); }
+
+/* The full boundary survives a greyscale print and keeps the blocked state
+   legible without relying on an ornamental side accent. */
+.msg--blocked .msg__text {
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--danger);
+  border-radius: var(--r-md);
+  background: var(--danger-soft);
+}
+
+.msg--error {
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--danger);
+  border-radius: var(--r-md);
+  background: var(--danger-soft);
+}
+
+.msg--error .msg__who { color: var(--danger); }
+
+.msg__detail { margin: var(--s-2) 0 0; color: var(--muted); }
+
+/* --- markdown ------------------------------------------------------------ */
+
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+
+.md__p {
+  margin: 0 0 var(--s-3);
+  /* The agent lines up citations and columns inside prose; `pre-wrap` keeps
+     that alignment instead of collapsing it into a single space. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.md__list { margin: 0 0 var(--s-3); padding-left: var(--s-5); }
+.md__list li { margin-bottom: var(--s-1); }
+
+.md code {
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 0.875em;
+}
+
+/* Its own scroll container, and this is not a nicety: the guide answers
+   architecture questions with 80-column ASCII diagrams, and without
+   `overflow-x` here the whole page scrolls sideways to show one. */
+.md__code {
+  margin: 0 0 var(--s-3);
+  padding: var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  overflow-x: auto;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.md__code code { padding: 0; background: none; font-size: inherit; }
+
+/* --- the rail ------------------------------------------------------------
+   Arrival order, unsorted. The service emits a switched-off gate's skip from
+   the hook where that gate would have run, so the sequence on the wire is the
+   sequence that happened. */
+
+.rail {
+  margin-top: var(--s-3);
+  padding-top: var(--s-3);
+  border-top: 1px dashed var(--border);
+}
+
+.rail__cells {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-4);
+}
+
+.rail__cell {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+}
+
+/* One hue per kind, set on the mark rather than the whole cell so the label
+   stays at full contrast against the page. The `data-kind` attribute comes
+   straight off the wire — the client is grouping by a field it does not have to
+   understand, which is what lets it render an agent nobody has written yet. */
+.rail__mark { color: var(--muted); }
+.rail__cell[data-kind="guard_in"] .rail__mark,
+.rail__cell[data-kind="guard_out"] .rail__mark { color: var(--primary); }
+.rail__cell[data-kind="model"] .rail__mark { color: var(--accent); }
+.rail__cell[data-kind="tool"] .rail__mark { color: var(--tool); }
+
+/* Struck through, never hidden. A stage that was switched off and a stage that
+   ran and passed must not look alike — and a hidden cell reads as neither. */
+.rail__cell--skip { opacity: 0.6; }
+.rail__cell--skip .rail__label,
+.rail__cell--skip .rail__ms { text-decoration: line-through; }
+
+/* Colour *and* weight *and* a different glyph, set in the component. Colour
+   alone is lost in a screenshot and to a reader who cannot see red. The
+   `!important` is because the kind rules above are equally specific and a
+   blocked cell's status has to win over its kind. */
+.rail__cell--blocked { color: var(--danger); font-weight: 600; }
+.rail__cell--blocked .rail__mark { color: var(--danger) !important; }
+.rail__cell--skip .rail__mark { color: var(--muted) !important; }
+
+.rail__totals {
+  margin: var(--s-2) 0 0;
+  color: var(--muted);
+}
+
+.rail__trace { color: var(--accent); text-decoration: none; }
+.rail__trace:hover { text-decoration: underline; }
+
+/* --- violations ---------------------------------------------------------- */
+
+.violations {
+  list-style: none;
+  margin: var(--s-3) 0 0;
+  padding: var(--s-3);
+  border: 1px solid var(--danger);
+  border-radius: var(--r-md);
+  background: var(--danger-soft);
+}
+
+.violations__item {
+  display: grid;
+  gap: 2px;
+  font-size: 0.75rem;
+}
+
+.violations__item + .violations__item {
+  margin-top: var(--s-3);
+  padding-top: var(--s-3);
+  border-top: 1px dashed var(--danger);
+}
+
+.violations__check { color: var(--danger); font-weight: 600; }
+.violations__rule { color: var(--muted); }
+.violations__detail { color: var(--text); }
+.violations__evidence { color: var(--muted); overflow-wrap: anywhere; }
+
+/* --- composer ------------------------------------------------------------ */
+
+.composer { padding: var(--s-3) var(--s-4) var(--s-5); }
+
+.composer__pill {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--s-2);
+  max-width: var(--thread-w);
+  margin: 0 auto;
+  padding: var(--s-2);
+  /* `--border-strong`, not `--border`: this is a control the reader aims at,
+     and 1.39:1 is not a boundary anybody can see. */
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  transition: box-shadow var(--dur-fast) var(--ease);
+}
+
+.composer__pill:focus-within { box-shadow: 0 0 0 3px var(--primary-soft); }
+
+.composer__input {
+  padding: var(--s-2);
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  /* 16px, because anything smaller makes iOS zoom the page on focus. */
+  font-size: 1rem;
+  line-height: 1.5;
+  resize: none;
+  overflow-y: auto;
+}
+
+.composer__input:focus { outline: none; }
+.composer__input::placeholder { color: var(--muted); }
+.composer__input:disabled { opacity: 0.6; }
+
+.composer__send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px; height: 36px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--primary);
+  color: var(--on-primary);
+  cursor: pointer;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+.composer__send:disabled { opacity: 0.4; cursor: default; }
+
+.composer__spinner {
+  width: 14px; height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 700ms linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- fatal --------------------------------------------------------------- */
+
+.fatal {
+  margin: 0;
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 0.875rem;
+}
+
+/* --- narrow -------------------------------------------------------------- */
+
+@media (max-width: 560px) {
+  .transcript { padding: var(--s-4) var(--s-3); }
+  .composer { padding: var(--s-2) var(--s-3) var(--s-4); }
+  .topbar__meta { display: none; }
+  .topbar__title { white-space: normal; }
+
+  .scenarios {
+    margin-bottom: var(--s-6);
+    padding: var(--s-5) var(--s-4);
+  }
+
+  .scenarios__intro { grid-template-columns: 1fr; gap: var(--s-5); }
+  .scenarios__intro h2 { font-size: clamp(2.35rem, 13vw, 3.4rem); }
+  .control-map {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 16px minmax(0, 1fr) 16px minmax(0, 1fr);
+    width: 100%;
+    min-width: 0;
+    overflow: visible;
+  }
+  .control-map span { min-width: 0; }
+  .control-map i { width: 100%; margin: 0; }
+  .scenarios__primary { grid-template-columns: 1fr; }
+  .scenario--featured { grid-row: auto; min-height: 13rem; }
+  .scenario {
+    grid-template-columns: auto minmax(0, 1fr);
+    min-width: 0;
+  }
+  .scenario__arrow { display: none; }
+}
+
+/* --- reduced motion -------------------------------------------------------
+   The blanket rule covers every transition and animation declared above. The
+   typewriter is a JavaScript timer and CSS cannot reach it — `useReducedMotion`
+   in the component is what switches that one off. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
